@@ -156,6 +156,31 @@ if (typeof TestData == "undefined") {
     TestData = undefined;
 }
 
+function __sanitizeMatch(flag) {
+    var sanitizeMatch = /-fsanitize=([^\s]+) /.exec(getBuildInfo()["buildEnvironment"]["ccflags"]);
+    if (flag && sanitizeMatch && RegExp(flag).exec(sanitizeMatch[1])) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function _isAddressSanitizerActive() {
+    return __sanitizeMatch("address");
+}
+
+function _isLeakSanitizerActive() {
+    return __sanitizeMatch("leak");
+}
+
+function _isThreadSanitizerActive() {
+    return __sanitizeMatch("thread");
+}
+
+function _isUndefinedBehaviorSanitizerActive() {
+    return __sanitizeMatch("undefined");
+}
+
 jsTestName = function() {
     if (TestData)
         return TestData.testName;
@@ -178,8 +203,9 @@ jsTestOptions = function() {
             noJournalPrealloc: TestData.noJournalPrealloc,
             auth: TestData.auth,
             keyFile: TestData.keyFile,
-            authUser: "__system",
+            authUser: TestData.authUser || "__system",
             authPassword: TestData.keyFileData,
+            authenticationDatabase: TestData.authenticationDatabase || "admin",
             authMechanism: TestData.authMechanism,
             adminUser: TestData.adminUser || "admin",
             adminPassword: TestData.adminPassword || "password",
@@ -194,6 +220,11 @@ jsTestOptions = function() {
             maxPort: TestData.maxPort,
             // Note: does not support the array version
             mongosBinVersion: TestData.mongosBinVersion || "",
+            shardMixedBinVersions: TestData.shardMixedBinVersions || false,
+            networkMessageCompressors: TestData.networkMessageCompressors,
+            skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
+            forceValidationWithFeatureCompatibilityVersion:
+                TestData.forceValidationWithFeatureCompatibilityVersion
         });
     }
     return _jsTestOptions;
@@ -228,10 +259,9 @@ jsTest.authenticate = function(conn) {
             // Set authenticated to stop an infinite recursion from getDB calling
             // back into authenticate.
             conn.authenticated = true;
-            print("Authenticating as internal " + jsTestOptions().authUser +
-                  " user with mechanism " + DB.prototype._defaultAuthenticationMechanism +
-                  " on connection: " + conn);
-            conn.authenticated = conn.getDB('admin').auth({
+            print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " +
+                  DB.prototype._defaultAuthenticationMechanism + " on connection: " + conn);
+            conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
                 user: jsTestOptions().authUser,
                 pwd: jsTestOptions().authPassword,
             });
@@ -273,7 +303,15 @@ defaultPrompt = function() {
         var buildInfo = db.runCommand({buildInfo: 1});
         try {
             if (buildInfo.modules.indexOf("enterprise") > -1) {
-                prefix = "MongoDB Enterprise ";
+                prefix += "MongoDB Enterprise ";
+            }
+        } catch (e) {
+            // Don't do anything here. Just throw the error away.
+        }
+        var isMasterRes = db.runCommand({isMaster: 1, forShell: 1});
+        try {
+            if (isMasterRes.hasOwnProperty("automationServiceDescriptor")) {
+                prefix += "[automated] ";
             }
         } catch (e) {
             // Don't do anything here. Just throw the error away.
@@ -316,7 +354,7 @@ defaultPrompt = function() {
         // try to use isMaster?
         if (status.isMaster) {
             try {
-                var prompt = isMasterStatePrompt();
+                var prompt = isMasterStatePrompt(isMasterRes);
                 status.isMaster = true;
                 db.getMongo().authStatus = status;
                 return prefix + prompt;
@@ -361,9 +399,9 @@ replSetMemberStatePrompt = function() {
     return state + '> ';
 };
 
-isMasterStatePrompt = function() {
+isMasterStatePrompt = function(isMasterResponse) {
     var state = '';
-    var isMaster = db.runCommand({isMaster: 1, forShell: 1});
+    var isMaster = isMasterResponse || db.runCommand({isMaster: 1, forShell: 1});
     if (isMaster.ok) {
         var role = "";
 

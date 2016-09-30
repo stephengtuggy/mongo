@@ -35,7 +35,7 @@
 #include <limits>
 
 #include "mongo/db/audit.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -150,14 +150,9 @@ HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
 
 HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
                                                          const Timestamp& lastTimestampApplied) {
-    // If we are primary, then we aren't syncing from anyone (else).
-    if (_iAmPrimary()) {
-        return HostAndPort();
-    }
-
     // If we are not a member of the current replica set configuration, no sync source is valid.
     if (_selfIndex == -1) {
-        LOG(2) << "Cannot sync from any members because we are not in the replica set config";
+        LOG(1) << "Cannot sync from any members because we are not in the replica set config";
         return HostAndPort();
     }
 
@@ -166,9 +161,9 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
         invariant(_forceSyncSourceIndex < _rsConfig.getNumMembers());
         _syncSource = _rsConfig.getMemberAt(_forceSyncSourceIndex).getHostAndPort();
         _forceSyncSourceIndex = -1;
+        log() << "choosing sync source candidate by request: " << _syncSource;
         std::string msg(str::stream() << "syncing from: " << _syncSource.toString()
                                       << " by request");
-        log() << msg << rsLog;
         setMyHeartbeatMessage(now, msg);
         return _syncSource;
     }
@@ -186,19 +181,20 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
     // If we are only allowed to sync from the primary, set that
     if (!_rsConfig.isChainingAllowed()) {
         if (_currentPrimaryIndex == -1) {
-            LOG(1) << "Cannot select sync source because chaining is"
+            LOG(1) << "Cannot select a sync source because chaining is"
                       " not allowed and primary is unknown/down";
             _syncSource = HostAndPort();
             return _syncSource;
         } else if (_memberIsBlacklisted(*_currentPrimaryMember(), now)) {
-            LOG(1) << "Cannot select sync source because chaining is"
-                      "not allowed and primary is not currently accepting our updates";
+            LOG(1) << "Cannot select primary member as sync source because they are blacklisted:"
+                   << _currentPrimaryMember()->getHostAndPort();
             _syncSource = HostAndPort();
             return _syncSource;
         } else {
-            _syncSource = _rsConfig.getMemberAt(_currentPrimaryIndex).getHostAndPort();
+            _syncSource = _currentPrimaryMember()->getHostAndPort();
+            log() << "chaining not allowed, choosing primary as sync source candidate: "
+                  << _syncSource;
             std::string msg(str::stream() << "syncing from primary: " << _syncSource.toString());
-            log() << msg << rsLog;
             setMyHeartbeatMessage(now, msg);
             return _syncSource;
         }
@@ -243,54 +239,78 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
             if (itIndex == _selfIndex) {
                 continue;
             }
+
+            const MemberConfig& itMemberConfig(_rsConfig.getMemberAt(itIndex));
+
             // Candidate must be up to be considered.
             if (!it->up()) {
+                LOG(2) << "Cannot select sync source because it is not up: "
+                       << itMemberConfig.getHostAndPort();
                 continue;
             }
             // Candidate must be PRIMARY or SECONDARY state to be considered.
             if (!it->getState().readable()) {
+                LOG(2) << "Cannot select sync source because it is not readable: "
+                       << itMemberConfig.getHostAndPort();
                 continue;
             }
-
-            const MemberConfig& itMemberConfig(_rsConfig.getMemberAt(itIndex));
 
             // Things to skip on the first attempt.
             if (attempts == 0) {
                 // Candidate must be a voter if we are a voter.
                 if (_selfConfig().isVoter() && !itMemberConfig.isVoter()) {
+                    LOG(2) << "Cannot select sync source because of voting differences: "
+                           << itMemberConfig.getHostAndPort();
                     continue;
                 }
                 // Candidates must not be hidden.
                 if (itMemberConfig.isHidden()) {
+                    LOG(2) << "Cannot select sync source because it is hidden: "
+                           << itMemberConfig.getHostAndPort();
                     continue;
                 }
                 // Candidates cannot be excessively behind.
                 if (it->getAppliedOpTime() < oldestSyncOpTime) {
+                    LOG(2) << "Cannot select sync source because it is too far behind: "
+                           << itMemberConfig.getHostAndPort();
                     continue;
                 }
                 // Candidate must not have a configured delay larger than ours.
                 if (_selfConfig().getSlaveDelay() < itMemberConfig.getSlaveDelay()) {
+                    LOG(2) << "Cannot select sync source with larger slaveDelay than ours: "
+                           << itMemberConfig.getHostAndPort();
                     continue;
                 }
             }
             // Candidate must build indexes if we build indexes, to be considered.
             if (_selfConfig().shouldBuildIndexes()) {
                 if (!itMemberConfig.shouldBuildIndexes()) {
+                    LOG(2) << "Cannot select sync source with shouldBuildIndex differences: "
+                           << itMemberConfig.getHostAndPort();
+
                     continue;
                 }
             }
             // only consider candidates that are ahead of where we are
             if (it->getAppliedOpTime().getTimestamp() <= lastTimestampApplied) {
+                LOG(1) << "Cannot select sync source behind our last applied optime: "
+                       << itMemberConfig.getHostAndPort();
                 continue;
             }
             // Candidate cannot be more latent than anything we've already considered.
             if ((closestIndex != -1) &&
                 (_getPing(itMemberConfig.getHostAndPort()) >
                  _getPing(_rsConfig.getMemberAt(closestIndex).getHostAndPort()))) {
+                LOG(2) << "Cannot select sync source with higher latency than the best candidate: "
+                       << itMemberConfig.getHostAndPort();
+
                 continue;
             }
             // Candidate cannot be blacklisted.
             if (_memberIsBlacklisted(itMemberConfig, now)) {
+                LOG(1) << "Cannot select sync source which is blacklisted: "
+                       << itMemberConfig.getHostAndPort();
+
                 continue;
             }
             // This candidate has passed all tests; set 'closestIndex'
@@ -313,8 +333,8 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
         return _syncSource;
     }
     _syncSource = _rsConfig.getMemberAt(closestIndex).getHostAndPort();
+    log() << "sync source candidate: " << _syncSource;
     std::string msg(str::stream() << "syncing from: " << _syncSource.toString(), 0);
-    log() << msg << rsLog;
     setMyHeartbeatMessage(now, msg);
     return _syncSource;
 }
@@ -1518,6 +1538,7 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplSetStatusArgs& rsS
     const Date_t now = rsStatusArgs.now;
     const OpTime& lastOpApplied = rsStatusArgs.lastOpApplied;
     const OpTime& lastOpDurable = rsStatusArgs.lastOpDurable;
+    const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
 
     if (_selfIndex == -1) {
         // We're REMOVED or have an invalid config
@@ -1640,7 +1661,7 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplSetStatusArgs& rsS
     }
 
     // sort members bson
-    sort(membersOut.begin(), membersOut.end());
+    sort(membersOut.begin(), membersOut.end(), SimpleBSONObjComparator::kInstance.makeLessThan());
 
     response->append("set", _rsConfig.isInitialized() ? _rsConfig.getReplSetName() : "");
     response->append("date", now);
@@ -1670,6 +1691,9 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplSetStatusArgs& rsS
     appendOpTime(&optimes, "durableOpTime", lastOpDurable, _rsConfig.getProtocolVersion());
     response->append("optimes", optimes.obj());
 
+    if (!initialSyncStatus.isEmpty()) {
+        response->append("initialSyncStatus", initialSyncStatus);
+    }
 
     response->append("members", membersOut);
     *result = Status::OK();
@@ -1746,9 +1770,16 @@ void TopologyCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* response)
     }
 }
 
-void TopologyCoordinatorImpl::prepareFreezeResponse(Date_t now,
-                                                    int secs,
-                                                    BSONObjBuilder* response) {
+StatusWith<TopologyCoordinatorImpl::PrepareFreezeResponseResult>
+TopologyCoordinatorImpl::prepareFreezeResponse(Date_t now, int secs, BSONObjBuilder* response) {
+    if (_role != TopologyCoordinator::Role::follower) {
+        std::string msg = str::stream()
+            << "cannot freeze node when primary or running for election. state: "
+            << (_role == TopologyCoordinator::Role::leader ? "Primary" : "Running-Election");
+        log() << msg;
+        return Status(ErrorCodes::NotSecondary, msg);
+    }
+
     if (secs == 0) {
         _stepDownUntil = now;
         log() << "'unfreezing'";
@@ -1761,18 +1792,17 @@ void TopologyCoordinatorImpl::prepareFreezeResponse(Date_t now,
             // we must transition to candidate now that our stepdown period
             // is no longer active, in leiu of heartbeats.
             _role = Role::candidate;
+            return PrepareFreezeResponseResult::kElectSelf;
         }
     } else {
         if (secs == 1)
             response->append("warning", "you really want to freeze for only 1 second?");
 
-        if (!_iAmPrimary()) {
-            _stepDownUntil = std::max(_stepDownUntil, now + Seconds(secs));
-            log() << "'freezing' for " << secs << " seconds";
-        } else {
-            log() << "received freeze command but we are primary";
-        }
+        _stepDownUntil = std::max(_stepDownUntil, now + Seconds(secs));
+        log() << "'freezing' for " << secs << " seconds";
     }
+
+    return PrepareFreezeResponseResult::kNoAction;
 }
 
 bool TopologyCoordinatorImpl::becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now) {

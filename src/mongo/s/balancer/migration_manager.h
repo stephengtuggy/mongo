@@ -28,16 +28,29 @@
 
 #pragma once
 
+#include <list>
+#include <map>
+#include <vector>
+
+#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/balancer/balancer_chunk_selection_policy.h"
+#include "mongo/s/balancer/balancer_policy.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
 
 class OperationContext;
+class ServiceContext;
 class Status;
-class MigrationSecondaryThrottleOptions;
+template <typename T>
+class StatusWith;
 
 // Uniquely identifies a migration, regardless of shard and version.
 typedef std::string MigrationIdentifier;
@@ -52,141 +65,230 @@ class MigrationManager {
     MONGO_DISALLOW_COPYING(MigrationManager);
 
 public:
-    MigrationManager() = default;
-    ~MigrationManager() = default;
+    MigrationManager(ServiceContext* serviceContext);
+    ~MigrationManager();
 
     /**
      * A blocking method that attempts to schedule all the migrations specified in
-     * "candidateMigrations". Takes the distributed lock for each collection with a chunk being
-     * migrated.
+     * "candidateMigrations" and wait for them to complete. Takes the distributed lock for each
+     * collection with a chunk being migrated.
+     *
+     * If any of the migrations, which were scheduled in parallel fails with a LockBusy error
+     * reported from the shard, retries it serially without the distributed lock.
      *
      * Returns a map of migration Status objects to indicate the success/failure of each migration.
      */
-    MigrationStatuses scheduleMigrations(
+    MigrationStatuses executeMigrationsForAutoBalance(
         OperationContext* txn,
-        const BalancerChunkSelectionPolicy::MigrateInfoVector& candidateMigrations);
+        const std::vector<MigrateInfo>& migrateInfos,
+        uint64_t maxChunkSizeBytes,
+        const MigrationSecondaryThrottleOptions& secondaryThrottle,
+        bool waitForDelete);
+
+    /**
+     * A blocking method that attempts to schedule the migration specified in "migrateInfo" and
+     * waits for it to complete. Takes the distributed lock for the namespace which is being
+     * migrated.
+     *
+     * Returns the status of the migration.
+     */
+    Status executeManualMigration(OperationContext* txn,
+                                  const MigrateInfo& migrateInfo,
+                                  uint64_t maxChunkSizeBytes,
+                                  const MigrationSecondaryThrottleOptions& secondaryThrottle,
+                                  bool waitForDelete);
+
+    /**
+     * Non-blocking method that puts the migration manager in the kRecovering state, in which
+     * new migration requests will block until finishRecovery is called. Then does local writes to
+     * reacquire the distributed locks for active migrations.
+     *
+     * The active migration recovery may fail and be abandoned, setting the state to kEnabled.
+     */
+    void startRecoveryAndAcquireDistLocks(OperationContext* txn);
+
+    /**
+     * Blocking method that must only be called after startRecovery has been called. Recovers the
+     * state of the migration manager (if necessary and able) and puts it in the kEnabled state,
+     * where it will accept new migrations. Any migrations waiting on the recovery state will be
+     * unblocked once the state is kEnabled, and then this function waits for the recovered active
+     * migrations to finish before returning.
+     *
+     * The active migration recovery may fail and be abandoned, setting the state to kEnabled and
+     * unblocking any process waiting on the recovery state.
+     */
+    void finishRecovery(OperationContext* txn,
+                        uint64_t maxChunkSizeBytes,
+                        const MigrationSecondaryThrottleOptions& secondaryThrottle,
+                        bool waitForDelete);
+
+    /**
+     * Non-blocking method that should never be called concurrently with finishRecovery. Puts the
+     * manager in a state where all subsequently scheduled migrations will immediately fail (without
+     * ever getting scheduled) and all active ones will be cancelled. It has no effect if the
+     * migration manager is already stopping or stopped.
+     */
+    void interruptAndDisableMigrations();
+
+    /**
+     * Blocking method that waits for any currently scheduled migrations to complete. Must be
+     * called after interruptAndDisableMigrations has been called in order to be able to re-enable
+     * migrations again.
+     */
+    void drainActiveMigrations();
 
 private:
+    // The current state of the migration manager
+    enum class State {  // Allowed transitions:
+        kStopped,       // kRecovering
+        kRecovering,    // kEnabled, kStopping
+        kEnabled,       // kStopping
+        kStopping,      // kStopped
+    };
+
     /**
-     * Holds the data associated with an ongoing migration. Stores a callback handle for the
-     * moveChunk command when one is scheduled. Also holds a flag that indicates the source shard is
-     * v3.2 and must take the distributed lock itself.
+     * Tracks the execution state of a single migration.
      */
     struct Migration {
-        Migration(const MigrateInfo& migrateInfo,
-                  boost::optional<executor::TaskExecutor::CallbackHandle> callbackHandle);
+        Migration(NamespaceString nss, BSONObj moveChunkCmdObj);
+        ~Migration();
 
-        void setCallbackHandle(executor::TaskExecutor::CallbackHandle callbackHandle);
-        void clearCallbackHandle();
+        // Namespace for which this migration applies
+        NamespaceString nss;
 
-        // Pointer to the chunk details.
-        const MigrateInfo* chunkInfo;
+        // Command object representing the migration
+        BSONObj moveChunkCmdObj;
 
-        // Callback handle for the active moveChunk request. If no migration is active for the chunk
-        // specified in "chunkInfo", this won't be set.
-        boost::optional<executor::TaskExecutor::CallbackHandle> moveChunkCallbackHandle;
+        // Callback handle for the migration network request. If the migration has not yet been sent
+        // on the network, this value is not set.
+        boost::optional<executor::TaskExecutor::CallbackHandle> callbackHandle;
 
-        // Indicates that the first moveChunk request failed with LockBusy. The second attempt must
-        // be made without the balancer holding the collection distlock. This is necessary for
-        // compatibility with a v3.2 shard, which expects to take the distlock itself.
-        bool oldShard;
+        // Notification, which will be signaled when the migration completes
+        std::shared_ptr<Notification<Status>> completionNotification;
     };
 
+    // Used as a type in which to store a list of active migrations. The reason to choose list is
+    // that its iterators do not get invalidated when entries are removed around them. This allows
+    // O(1) removal time.
+    using MigrationsList = std::list<Migration>;
+
     /**
-     * Manages and maintains a collection distlock, which should normally be held by the balancer,
-     * but in the case of a migration with a v3.2 source shard the balancer must release it in order
-     * to allow the shard to acquire it.
+     * Contains the runtime state for a single collection. This class does not have concurrency
+     * control of its own and relies on the migration manager's mutex.
      */
-    struct DistLockTracker {
-        DistLockTracker(boost::optional<DistLockManager::ScopedDistLock> distlock);
+    struct CollectionMigrationsState {
+        CollectionMigrationsState(DistLockHandle distLockHandle);
+        ~CollectionMigrationsState();
 
-        // Holds the distributed lock, if the balancer should hold it for the migration. If this is
-        // empty, then a shard has the distlock.
-        boost::optional<DistLockManager::ScopedDistLock> distributedLock;
+        // Dist lock handle, which must be released at destruction time.
+        const DistLockHandle distLockHandle;
 
-        // The number of migrations that are currently using the balancer held distributed lock.
-        int migrationCounter;
+        // Contains a set of migrations which are currently active for this namespace.
+        MigrationsList migrations;
     };
 
+    using CollectionMigrationsStateMap =
+        stdx::unordered_map<NamespaceString, CollectionMigrationsState>;
+
     /**
-     * Blocking function that schedules all the migrations prepared in "_activeMigrations" and then
-     * waits for them all to complete. This is also where the distributed locks are taken. Some
-     * migrations may be rescheduled for a recursive call of this function if there are distributed
-     * lock conflicts. A lock conflict can occur when:
-     *     1) The source shard of a migration is v3.2 and expects to take the lock itself and the
-     *        balancer already holds it for a different migration.
-     *     2) A v3.2 shard already has the distlock, so it isn't free for either the balancer to
-     *        take or another v3.2 shard.
-     * All lock conflicts are resolved by waiting for all of the scheduled migrations to complete,
-     * at which point all the locks are safely released.
+     * Optionally takes the collection distributed lock and schedules a chunk migration with the
+     * specified parameters. May block for distributed lock acquisition. If dist lock acquisition is
+     * successful (or not done), schedules the migration request and returns a notification which
+     * can be used to obtain the outcome of the operation.
      *
-     * All the moveChunk command Status results are placed in "migrationStatuses".
+     * The 'shardTakesCollectionDistLock' parameter controls whether the distributed lock is
+     * acquired by the migration manager or by the shard executing the migration request.
      */
-    void _executeMigrations(OperationContext* txn,
-                            std::map<MigrationIdentifier, Status>* migrationStatuses);
-
-    /**
-     * Callback function that checks a remote command response for errors. If there is a LockBusy
-     * error, the first time this happens the shard starting the migration is assumed to be v3.2 and
-     * is marked such and rescheduled. On other errors, the migration is abandoned. Places all of
-     * the Status results from the moveChunk commands in "migrationStatuses".
-     */
-    void _checkMigrationCallback(
-        const executor::TaskExecutor::RemoteCommandCallbackArgs& callbackArgs,
+    std::shared_ptr<Notification<Status>> _schedule(
         OperationContext* txn,
-        Migration* migration,
-        std::map<MigrationIdentifier, Status>* migrationStatuses);
+        const MigrateInfo& migrateInfo,
+        bool shardTakesCollectionDistLock,
+        uint64_t maxChunkSizeBytes,
+        const MigrationSecondaryThrottleOptions& secondaryThrottle,
+        bool waitForDelete);
 
     /**
-     * Goes through the callback handles in "_activeMigrations" and waits for the moveChunk commands
-     * to return.
-     */
-    void _waitForMigrations(OperationContext* txn) const;
-
-    /**
-     * Adds "migration" to "_rescheduledMigrations" vector.
-     */
-    void _rescheduleMigration(const Migration& migration);
-
-    /**
-     * Attempts to take a distlock for collection "ns", if appropriate. It may
-     *     1) Take the distlock for the balancer and initialize the counter to 1.
-     *     2) Increment the counter on the distlock that the balancer already holds.
-     *     3) Initialize the counter to 0 to indicate a migration with a v3.2 shard, where the shard
-     *        will take the distlock.
+     * Acquires the collection distributed lock for the specified namespace and if it succeeds,
+     * schedules the migration.
      *
-     * If none of these actions are possible because of a lock conflict (shard can't take the lock
-     * if the balancer already holds it, or vice versa) or if the lock is unavailable, returns
-     * false to indicate that the migration cannot proceed right now. If the lock could not be
-     * taken because of a lock conflict as described, then the migration is rescheduled; otherwise
-     * it is abandoned.
-     *
-     * If an attempt to acquire the distributed lock fails and the migration is abandoned, the error
-     * Status is placed in "migrationStatuses".
+     * The distributed lock is acquired before scheduling the first migration for the collection and
+     * is only released when all active migrations on the collection have finished.
      */
-    bool _takeDistLockForAMigration(OperationContext* txn,
-                                    const Migration& migration,
-                                    MigrationStatuses* migrationStatuses);
+    void _scheduleWithDistLock_inlock(OperationContext* txn,
+                                      const HostAndPort& targetHost,
+                                      Migration migration);
 
     /**
-     * Attempts to acquire the distributed collection lock necessary required for "migration".
+     * Used internally for migrations scheduled with the distributed lock acquired by the config
+     * server. Called exactly once for each scheduled migration, it will signal the migration in the
+     * passed iterator and if this is the last migration for the collection will free the collection
+     * distributed lock.
      */
-    StatusWith<DistLockManager::ScopedDistLock> _getDistLock(OperationContext* txn,
-                                                             const Migration& migration);
+    void _completeWithDistLock_inlock(OperationContext* txn,
+                                      MigrationsList::iterator itMigration,
+                                      Status status);
 
-    // Protects class variables when migrations run in parallel.
+    /**
+     * Immediately schedules the specified migration without attempting to acquire the collection
+     * distributed lock or checking that it is not being held.
+     *
+     * This method is only used for retrying migrations that have failed with LockBusy errors
+     * returned by the shard, which only happens with legacy 3.2 shards that take the collection
+     * distributed lock themselves.
+     */
+    void _scheduleWithoutDistLock_inlock(OperationContext* txn,
+                                         const HostAndPort& targetHost,
+                                         Migration migration);
+
+    /**
+     * If the state of the migration manager is kStopping, checks whether there are any outstanding
+     * scheduled requests and if there aren't any signals the class condition variable.
+     */
+    void _checkDrained_inlock();
+
+    /**
+     * Blocking call, which waits for the migration manager to leave the recovering state (if it is
+     * currently recovering).
+     */
+    void _waitForRecovery();
+
+    /**
+     * Should only be called from startRecovery or finishRecovery functions when the migration
+     * manager is in either the kStopped or kRecovering state. Releases all the distributed locks
+     * that the balancer holds, clears the config.migrations collection, changes the state of the
+     * migration manager to kEnabled. Then unblocks all processes waiting for kEnabled state.
+     */
+    void _abandonActiveMigrationsAndEnableManager(OperationContext* txn);
+
+    // The service context under which this migration manager runs.
+    ServiceContext* const _serviceContext;
+
+    // Used as a constant session ID for all distributed locks that this MigrationManager holds.
+    // Currently required so that locks can be reacquired for the balancer in startRecovery and then
+    // overtaken in later operations.
+    OID _lockSessionID;
+
+    // Carries migration information over from startRecovery to finishRecovery. Should only be set
+    // in startRecovery and then accessed in finishRecovery.
+    stdx::unordered_map<NamespaceString, std::list<MigrateInfo>> _migrationRecoveryMap;
+
+    // Protects the class state below.
     stdx::mutex _mutex;
 
-    // Holds information about each ongoing migration.
-    std::vector<Migration> _activeMigrations;
+    // Always start the migration manager in a stopped state.
+    State _state{State::kStopped};
 
-    // Temporary container for migrations that must be rescheduled. After all of the
-    // _activeMigrations are finished, this variable is used to reset _activeMigrations before
-    // executing migrations again.
-    std::vector<Migration> _rescheduledMigrations;
+    // Condition variable, which is waited on when the migration manager's state is changing and
+    // signaled when the state change is complete.
+    stdx::condition_variable _condVar;
 
-    // Manages the distributed locks and whether the balancer or shard holds them.
-    std::map<std::string, DistLockTracker> _distributedLocks;
+    // Holds information about each collection's distributed lock and active migrations via a
+    // CollectionMigrationState object.
+    CollectionMigrationsStateMap _activeMigrationsWithDistLock;
+
+    // Holds information about migrations, which have been scheduled without the collection
+    // distributed lock acquired (i.e., the shard is asked to acquire it).
+    MigrationsList _activeMigrationsWithoutDistLock;
 };
 
 }  // namespace mongo

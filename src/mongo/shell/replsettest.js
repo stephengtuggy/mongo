@@ -85,6 +85,8 @@ var ReplSetTest = function(opts) {
     var _unbridgedPorts;
     var _unbridgedNodes;
 
+    this.kDefaultTimeoutMs = 10 * 60 * 1000;
+
     // Publicly exposed variables
 
     /**
@@ -154,7 +156,7 @@ var ReplSetTest = function(opts) {
             return;
         }
 
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         if (!node.getDB) {
             node = self.nodes[node];
@@ -306,6 +308,23 @@ var ReplSetTest = function(opts) {
             {ts: Timestamp(0, 0), t: NumberLong(0)};
     }
 
+    /**
+     * Returns the last durable OpTime timestamp for the host if running with journaling.
+     * Returns the last applied OpTime timestamp otherwise.
+     */
+    function _getDurableOpTimeTimestamp(conn) {
+        var replSetStatus =
+            assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
+
+        var runningWithoutJournaling = TestData.noJournal || "inMemory" == TestData.storageEngine ||
+            "ephemeralForTest" == TestData.storageEngine;
+        var opTimeType = "durableOpTime";
+        if (runningWithoutJournaling) {
+            opTimeType = "appliedOpTime";
+        }
+        return replSetStatus.optimes[opTimeType].ts;
+    }
+
     function _isEarlierTimestamp(ts1, ts2) {
         if (ts1.getTime() == ts2.getTime()) {
             return ts1.getInc() < ts2.getInc();
@@ -454,7 +473,7 @@ var ReplSetTest = function(opts) {
      * Blocks until the secondary nodes have completed recovery and their roles are known.
      */
     this.awaitSecondaryNodes = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             // Reload who the current slaves are
@@ -478,7 +497,7 @@ var ReplSetTest = function(opts) {
      * Blocks until all nodes agree on who the primary is.
      */
     this.awaitNodesAgreeOnPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             var primary = -1;
@@ -518,7 +537,7 @@ var ReplSetTest = function(opts) {
      * if primary is available will return a connection to it. Otherwise throws an exception.
      */
     this.getPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
         var primary = null;
 
         assert.soonNoExcept(function() {
@@ -531,7 +550,7 @@ var ReplSetTest = function(opts) {
 
     this.awaitNoPrimary = function(msg, timeout) {
         msg = msg || "Timed out waiting for there to be no primary in replset: " + this.name;
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             return _callIsMaster() == false;
@@ -607,7 +626,7 @@ var ReplSetTest = function(opts) {
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
         var cmdKey = initCmd || 'replSetInitiate';
-        timeout = timeout || 120000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         this._setDefaultConfigOptions(config);
 
@@ -694,8 +713,10 @@ var ReplSetTest = function(opts) {
         return masterOpTime;
     };
 
-    this.awaitReplication = function(timeout) {
-        timeout = timeout || 30000;
+    // Wait until the optime of the specified type reaches the primary's last applied optime.
+    this.awaitReplication = function(timeout, secondaryOpTimeType) {
+        timeout = timeout || self.kDefaultTimeoutMS;
+        secondaryOpTimeType = secondaryOpTimeType || ReplSetTest.OpTimeType.LAST_APPLIED;
 
         var masterLatestOpTime;
 
@@ -711,7 +732,7 @@ var ReplSetTest = function(opts) {
                 }
 
                 return true;
-            }, "awaiting oplog query", 30000);
+            }, "awaiting oplog query", timeout);
         };
 
         awaitLastOpTimeWrittenFn();
@@ -783,7 +804,12 @@ var ReplSetTest = function(opts) {
 
                     slave.getDB("admin").getMongo().setSlaveOk();
 
-                    var ts = _getLastOpTimeTimestamp(slave);
+                    var getSecondaryTimestampFn = _getLastOpTimeTimestamp;
+                    if (secondaryOpTimeType == ReplSetTest.OpTimeType.LAST_DURABLE) {
+                        getSecondaryTimestampFn = _getDurableOpTimeTimestamp;
+                    }
+
+                    var ts = getSecondaryTimestampFn(slave);
                     if (masterLatestOpTime.t < ts.t ||
                         (masterLatestOpTime.t == ts.t && masterLatestOpTime.i < ts.i)) {
                         masterLatestOpTime = _getLastOpTimeTimestamp(master);
@@ -834,6 +860,309 @@ var ReplSetTest = function(opts) {
             }
         });
         return res;
+    };
+
+    this.dumpOplog = function(conn, limit) {
+        print('Dumping the latest ' + limit + ' documents from the oplog of ' + conn.host);
+        var cursor =
+            conn.getDB('local').getCollection('oplog.rs').find().sort({$natural: -1}).limit(limit);
+        cursor.forEach(printjsononeline);
+    };
+
+    this.checkReplicatedDataHashes = function(excludedDBs = [], msgPrefix = undefined) {
+        // TODO: Remove nested functions -- SERVER-25644
+        'use strict';
+        function checkDBHashes(rst, dbBlacklist = [], msgPrefix = 'checkReplicatedDataHashes') {
+            function generateUniqueDbName(dbNames, prefix) {
+                var uniqueDbName;
+                Random.setRandomSeed();
+                do {
+                    uniqueDbName = prefix + Random.randInt(100000);
+                } while (dbNames.has(uniqueDbName));
+                return uniqueDbName;
+            }
+
+            // Return items that are in either Array `a` or `b` but not both. Note that this will
+            // not work with arrays containing NaN. Array.indexOf(NaN) will always return -1.
+            function arraySymmetricDifference(a, b) {
+                var inAOnly = a.filter(function(elem) {
+                    return b.indexOf(elem) < 0;
+                });
+
+                var inBOnly = b.filter(function(elem) {
+                    return a.indexOf(elem) < 0;
+                });
+
+                return inAOnly.concat(inBOnly);
+            }
+
+            function dumpCollectionDiff(primary, secondary, dbName, collName) {
+                print('Dumping collection: ' + dbName + '.' + collName);
+
+                var primaryColl = primary.getDB(dbName).getCollection(collName);
+                var secondaryColl = secondary.getDB(dbName).getCollection(collName);
+
+                var primaryDocs = primaryColl.find().sort({_id: 1}).toArray();
+                var secondaryDocs = secondaryColl.find().sort({_id: 1}).toArray();
+
+                var primaryIndex = primaryDocs.length - 1;
+                var secondaryIndex = secondaryDocs.length - 1;
+
+                var missingOnPrimary = [];
+                var missingOnSecondary = [];
+
+                while (primaryIndex >= 0 || secondaryIndex >= 0) {
+                    var primaryDoc = primaryDocs[primaryIndex];
+                    var secondaryDoc = secondaryDocs[secondaryIndex];
+
+                    if (primaryIndex < 0) {
+                        missingOnPrimary.push(tojsononeline(secondaryDoc));
+                        secondaryIndex--;
+                    } else if (secondaryIndex < 0) {
+                        missingOnSecondary.push(tojsononeline(primaryDoc));
+                        primaryIndex--;
+                    } else {
+                        if (!bsonBinaryEqual(primaryDoc, secondaryDoc)) {
+                            print('Mismatching documents:');
+                            print('    primary: ' + tojsononeline(primaryDoc));
+                            print('    secondary: ' + tojsononeline(secondaryDoc));
+                            var ordering = bsonWoCompare({wrapper: primaryDoc._id},
+                                                         {wrapper: secondaryDoc._id});
+                            if (ordering === 0) {
+                                primaryIndex--;
+                                secondaryIndex--;
+                            } else if (ordering < 0) {
+                                missingOnPrimary.push(tojsononeline(secondaryDoc));
+                                secondaryIndex--;
+                            } else if (ordering > 0) {
+                                missingOnSecondary.push(tojsononeline(primaryDoc));
+                                primaryIndex--;
+                            }
+                        } else {
+                            // Latest document matched.
+                            primaryIndex--;
+                            secondaryIndex--;
+                        }
+                    }
+                }
+
+                if (missingOnPrimary.length) {
+                    print('The following documents are missing on the primary:');
+                    print(missingOnPrimary.join('\n'));
+                }
+                if (missingOnSecondary.length) {
+                    print('The following documents are missing on the secondary:');
+                    print(missingOnSecondary.join('\n'));
+                }
+            }
+
+            function checkDBHashesForReplSet(rst, dbBlacklist, msgPrefix) {
+                // We don't expect the local database to match because some of its
+                // collections are not replicated.
+                dbBlacklist.push('local');
+
+                var success = true;
+                var hasDumpedOplog = false;
+
+                // Use liveNodes.master instead of getPrimary() to avoid the detection
+                // of a new primary.
+                // liveNodes must have been populated.
+                var primary = rst.liveNodes.master;
+                var combinedDBs = new Set(primary.getDBNames());
+
+                rst.getSecondaries().forEach(secondary => {
+                    secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
+                });
+
+                for (var dbName of combinedDBs) {
+                    if (Array.contains(dbBlacklist, dbName)) {
+                        continue;
+                    }
+
+                    var dbHashes = rst.getHashes(dbName);
+                    var primaryDBHash = dbHashes.master;
+                    assert.commandWorked(primaryDBHash);
+
+                    try {
+                        var primaryCollInfo = primary.getDB(dbName).getCollectionInfos();
+                    } catch (e) {
+                        if (jsTest.options().skipValidationOnInvalidViewDefinitions) {
+                            assert.commandFailedWithCode(e, ErrorCodes.InvalidViewDefinition);
+                            print('Skipping dbhash check on ' + dbName +
+                                  ' because of invalid views in system.views');
+                            continue;
+                        } else {
+                            throw e;
+                        }
+                    }
+
+                    dbHashes.slaves.forEach(secondaryDBHash => {
+                        assert.commandWorked(secondaryDBHash);
+
+                        var secondary =
+                            rst.liveNodes.slaves.find(node => node.host === secondaryDBHash.host);
+                        assert(
+                            secondary,
+                            'could not find the replica set secondary listed in the dbhash response ' +
+                                tojson(secondaryDBHash));
+
+                        var primaryCollections = Object.keys(primaryDBHash.collections);
+                        var secondaryCollections = Object.keys(secondaryDBHash.collections);
+
+                        if (primaryCollections.length !== secondaryCollections.length) {
+                            print(
+                                msgPrefix +
+                                ', the primary and secondary have a different number of collections: ' +
+                                tojson(dbHashes));
+                            for (var diffColl of arraySymmetricDifference(primaryCollections,
+                                                                          secondaryCollections)) {
+                                dumpCollectionDiff(primary, secondary, dbName, diffColl);
+                            }
+                            success = false;
+                        }
+
+                        var nonCappedCollNames = primaryCollections.filter(
+                            collName => !primary.getDB(dbName).getCollection(collName).isCapped());
+                        // Only compare the dbhashes of non-capped collections because capped
+                        // collections are not necessarily truncated at the same points
+                        // across replica set members.
+                        nonCappedCollNames.forEach(collName => {
+                            if (primaryDBHash.collections[collName] !==
+                                secondaryDBHash.collections[collName]) {
+                                print(msgPrefix +
+                                      ', the primary and secondary have a different hash for the' +
+                                      ' collection ' + dbName + '.' + collName + ': ' +
+                                      tojson(dbHashes));
+                                dumpCollectionDiff(primary, secondary, dbName, collName);
+                                success = false;
+                            }
+
+                        });
+
+                        // Check that collection information is consistent on the primary and
+                        // secondaries.
+                        var secondaryCollInfo = secondary.getDB(dbName).getCollectionInfos();
+                        secondaryCollInfo.forEach(secondaryInfo => {
+                            primaryCollInfo.forEach(primaryInfo => {
+                                if (secondaryInfo.name === primaryInfo.name) {
+                                    if (!bsonBinaryEqual(secondaryInfo, primaryInfo)) {
+                                        print(msgPrefix +
+                                              ', the primary and secondary have different ' +
+                                              'attributes for the collection ' + dbName + '.' +
+                                              secondaryInfo.name);
+                                        print('Collection info on the primary: ' +
+                                              tojson(primaryInfo));
+                                        print('Collection info on the secondary: ' +
+                                              tojson(secondaryInfo));
+                                        success = false;
+                                    }
+                                }
+                            });
+                        });
+
+                        // Check that the following collection stats are the same across replica set
+                        // members:
+                        //  capped
+                        //  nindexes
+                        //  ns
+                        primaryCollections.forEach(collName => {
+                            var primaryCollStats =
+                                primary.getDB(dbName).runCommand({collStats: collName});
+                            assert.commandWorked(primaryCollStats);
+                            var secondaryCollStats =
+                                secondary.getDB(dbName).runCommand({collStats: collName});
+                            assert.commandWorked(secondaryCollStats);
+
+                            if (primaryCollStats.capped !== secondaryCollStats.capped ||
+                                primaryCollStats.nindexes !== secondaryCollStats.nindexes ||
+                                primaryCollStats.ns !== secondaryCollStats.ns) {
+                                print(msgPrefix +
+                                      ', the primary and secondary have different stats for the ' +
+                                      'collection ' + dbName + '.' + collName);
+                                print('Collection stats on the primary: ' +
+                                      tojson(primaryCollStats));
+                                print('Collection stats on the secondary: ' +
+                                      tojson(secondaryCollStats));
+                                success = false;
+                            }
+                        });
+
+                        if (nonCappedCollNames.length === primaryCollections.length) {
+                            // If the primary and secondary have the same hashes for all the
+                            // collections in the database and there aren't any capped collections,
+                            // then the hashes for the whole database should match.
+                            if (primaryDBHash.md5 !== secondaryDBHash.md5) {
+                                print(msgPrefix +
+                                      ', the primary and secondary have a different hash for ' +
+                                      'the ' + dbName + ' database: ' + tojson(dbHashes));
+                                success = false;
+                            }
+                        }
+
+                        if (!success) {
+                            if (!hasDumpedOplog) {
+                                rst.dumpOplog(primary, 100);
+                                rst.getSecondaries().forEach(secondary =>
+                                                                 rst.dumpOplog(secondary, 100));
+                                hasDumpedOplog = true;
+                            }
+                        }
+                    });
+                }
+
+                assert(success, 'dbhash mismatch between primary and secondary');
+            }
+
+            // Call getPrimary to populate rst with information about the nodes.
+            var primary = rst.getPrimary();
+            assert(primary, 'calling getPrimary() failed');
+
+            // Since we cannot determine if there is a background index in progress (SERVER-25176),
+            // we flush indexing as follows:
+            //  1. Create a foreground index on a dummy collection/database
+            //  2. Insert a document into the dummy collection with a writeConcern for all nodes
+            //  3. Drop the dummy database
+            var dbNames = new Set(primary.getDBNames());
+            var uniqueDbName = generateUniqueDbName(dbNames, "flush_all_background_indexes_");
+
+            var dummyDB = primary.getDB(uniqueDbName);
+            var dummyColl = dummyDB.dummy;
+            dummyColl.drop();
+            assert.commandWorked(dummyColl.createIndex({x: 1}));
+            assert.writeOK(dummyColl.insert(
+                {x: 1},
+                {writeConcern: {w: rst.nodeList().length, wtimeout: self.kDefaultTimeoutMS}}));
+            assert.commandWorked(dummyDB.dropDatabase());
+
+            var activeException = false;
+
+            try {
+                // Lock the primary to prevent the TTL monitor from deleting expired documents in
+                // the background while we are getting the dbhashes of the replica set members.
+                assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
+                                     'failed to lock the primary');
+                rst.awaitReplication(60 * 1000 * 5);
+                checkDBHashesForReplSet(rst, dbBlacklist, msgPrefix);
+            } catch (e) {
+                activeException = true;
+                throw e;
+            } finally {
+                // Allow writes on the primary.
+                var res = primary.adminCommand({fsyncUnlock: 1});
+
+                if (!res.ok) {
+                    var msg = 'failed to unlock the primary, which may cause this' +
+                        ' test to hang: ' + tojson(res);
+                    if (activeException) {
+                        print(msg);
+                    } else {
+                        throw new Error(msg);
+                    }
+                }
+            }
+        }
+
+        checkDBHashes(this, excludedDBs, msgPrefix);
     };
 
     /**
@@ -890,7 +1219,12 @@ var ReplSetTest = function(opts) {
             options.binVersion = MongoRunner.versionIterator(options.binVersion);
         }
 
-        options = Object.merge(defaults, options);
+        // If restarting a node, use its existing options as the defaults.
+        if ((options && options.restart) || restart) {
+            options = Object.merge(this.nodes[n].fullOptions, options);
+        } else {
+            options = Object.merge(defaults, options);
+        }
         options = Object.merge(options, this.nodeOptions["n" + n]);
         delete options.rsConfig;
 
@@ -898,6 +1232,17 @@ var ReplSetTest = function(opts) {
 
         var pathOpts = {node: n, set: this.name};
         options.pathOpts = Object.merge(options.pathOpts || {}, pathOpts);
+
+        // Turn off periodic noop writes for replica sets by default.
+        options.setParameter = options.setParameter || {};
+        options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
+        options.setParameter.numInitialSyncAttempts =
+            options.setParameter.numInitialSyncAttempts || 1;
+        // We raise the number of initial sync connect attempts for tests that disallow chaining.
+        // Disabling chaining can cause sync source selection to take longer so we must increase
+        // the number of connection attempts.
+        options.setParameter.numInitialSyncConnectAttempts =
+            options.setParameter.numInitialSyncConnectAttempts || 60;
 
         if (tojson(options) != tojson({}))
             printjson(options);
@@ -913,6 +1258,11 @@ var ReplSetTest = function(opts) {
                 // host is the actual hostname of the machine and not localhost.
                 dest: getHostName() + ":" + _unbridgedPorts[n],
             });
+
+            if (jsTestOptions().networkMessageCompressors) {
+                bridgeOptions["networkMessageCompressors"] =
+                    jsTestOptions().networkMessageCompressors;
+            }
 
             this.nodes[n] = new MongoBridge(bridgeOptions);
         }
@@ -937,6 +1287,12 @@ var ReplSetTest = function(opts) {
 
         printjson(this.nodes);
 
+        // Clean up after noReplSet to ensure it doesn't effect future restarts.
+        if (options.noReplSet) {
+            this.nodes[n].fullOptions.replSet = defaults.replSet;
+            delete this.nodes[n].fullOptions.noReplSet;
+        }
+
         wait = wait || false;
         if (!wait.toFixed) {
             if (wait)
@@ -954,12 +1310,15 @@ var ReplSetTest = function(opts) {
     };
 
     /**
-     * Restarts a db without clearing the data directory by default.  If the server is not
-     * stopped first, this function will not work.
+     * Restarts a db without clearing the data directory by default, and using the node(s)'s
+     * original startup options by default.
      *
      * Option { startClean : true } forces clearing the data directory.
      * Option { auth : Object } object that contains the auth details for admin credentials.
      *   Should contain the fields 'user' and 'pwd'
+     *
+     * In order not to use the original startup options, use stop() (or stopSet()) followed by
+     * start() (or startSet()) without passing restart: true as part of the options.
      *
      * @param {int|conn|[int|conn]} n array or single server number (0, 1, 2, ...) or conn
      */
@@ -1266,6 +1625,11 @@ ReplSetTest.State = {
     REMOVED: 10,
 };
 
+ReplSetTest.OpTimeType = {
+    LAST_APPLIED: 1,
+    LAST_DURABLE: 2,
+};
+
 /**
  * Waits for the specified hosts to enter a certain state.
  */
@@ -1279,7 +1643,7 @@ ReplSetTest.awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
         return;
     }
 
-    timeout = timeout || 60000;
+    timeout = timeout || 5 * 60 * 1000;
 
     if (hostOk == undefined)
         hostOk = {ok: true};

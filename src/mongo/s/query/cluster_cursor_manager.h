@@ -29,7 +29,6 @@
 #pragma once
 
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 #include "mongo/db/cursor_id.h"
@@ -37,11 +36,13 @@
 #include "mongo/platform/random.h"
 #include "mongo/s/query/cluster_client_cursor.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class ClockSource;
+class OperationContext;
 template <typename T>
 class StatusWith;
 
@@ -153,7 +154,7 @@ public:
          *
          * Can block.
          */
-        StatusWith<boost::optional<BSONObj>> next();
+        StatusWith<ClusterQueryResult> next();
 
         /**
          * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
@@ -184,7 +185,7 @@ public:
         /**
          * Stashes 'obj' to be returned later by this cursor. A cursor must be owned.
          */
-        void queueResult(const BSONObj& obj);
+        void queueResult(const ClusterQueryResult& result);
 
         /**
          * Returns whether or not all the remote cursors underlying this cursor have been
@@ -200,6 +201,14 @@ public:
          * if the cursor is not tailable + awaitData).
          */
         Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
+
+
+        /**
+         * Update the operation context for remote requests.
+         *
+         * Network requests depend on having a valid operation context for user initiated actions.
+         */
+        void setOperationContext(OperationContext* txn);
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor
@@ -278,7 +287,9 @@ public:
      *
      * Does not block.
      */
-    StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss, CursorId cursorId);
+    StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss,
+                                            CursorId cursorId,
+                                            OperationContext* txn);
 
     /**
      * Informs the manager that the given cursor should be killed.  The cursor need not necessarily
@@ -350,7 +361,7 @@ public:
 
 private:
     class CursorEntry;
-    using CursorEntryMap = std::unordered_map<CursorId, CursorEntry>;
+    using CursorEntryMap = stdx::unordered_map<CursorId, CursorEntry>;
 
     /**
      * Transfers ownership of the given pinned cursor back to the manager, and moves the cursor to
@@ -517,13 +528,13 @@ private:
     //
     // Entries are added when the first cursor on the given namespace is registered, and removed
     // when the last cursor on the given namespace is destroyed.
-    std::unordered_map<uint32_t, NamespaceString> _cursorIdPrefixToNamespaceMap;
+    stdx::unordered_map<uint32_t, NamespaceString> _cursorIdPrefixToNamespaceMap;
 
     // Map from namespace to the CursorEntryContainer for that namespace.
     //
     // Entries are added when the first cursor on the given namespace is registered, and removed
     // when the last cursor on the given namespace is destroyed.
-    std::unordered_map<NamespaceString, CursorEntryContainer, NamespaceString::Hasher>
+    stdx::unordered_map<NamespaceString, CursorEntryContainer, NamespaceString::Hasher>
         _namespaceToContainerMap;
 
     size_t _cursorsTimedOut = 0;

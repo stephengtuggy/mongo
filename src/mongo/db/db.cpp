@@ -42,6 +42,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
@@ -56,6 +57,7 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -109,6 +111,8 @@
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balancer/balancer.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
@@ -124,7 +128,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -161,7 +164,9 @@ void (*snmpInit)() = NULL;
 
 extern int diagLogging;
 
-static const NamespaceString startupLogCollectionName("local.startup_log");
+namespace {
+
+const NamespaceString startupLogCollectionName("local.startup_log");
 
 #ifdef _WIN32
 ntservice::NtServiceDefaultStrings defaultServiceStrings = {
@@ -170,7 +175,7 @@ ntservice::NtServiceDefaultStrings defaultServiceStrings = {
 
 Timer startupSrandTimer;
 
-static void logStartup(OperationContext* txn) {
+void logStartup(OperationContext* txn) {
     BSONObjBuilder toLog;
     stringstream id;
     id << getHostNameCached() << "-" << jsTime().asInt64();
@@ -185,7 +190,7 @@ static void logStartup(OperationContext* txn) {
 
 
     BSONObjBuilder buildinfo(toLog.subobjStart("buildinfo"));
-    appendBuildInfo(buildinfo);
+    VersionInfoInterface::instance().appendBuildInfo(&buildinfo);
     appendStorageEngineList(&buildinfo);
     buildinfo.doneFast();
 
@@ -212,7 +217,7 @@ static void logStartup(OperationContext* txn) {
     wunit.commit();
 }
 
-static void checkForIdIndexes(OperationContext* txn, Database* db) {
+void checkForIdIndexes(OperationContext* txn, Database* db) {
     if (db->name() == "local") {
         // we do not need an _id index on anything in the local database
         return;
@@ -250,7 +255,7 @@ static void checkForIdIndexes(OperationContext* txn, Database* db) {
  * @returns the number of documents in local.system.replset or 0 if this was started with
  *          --replset.
  */
-static unsigned long long checkIfReplMissingFromCommandLine(OperationContext* txn) {
+unsigned long long checkIfReplMissingFromCommandLine(OperationContext* txn) {
     // This is helpful for the query below to work as you can't open files when readlocked
     ScopedTransaction transaction(txn, MODE_X);
     Lock::GlobalWrite lk(txn->lockState());
@@ -268,12 +273,21 @@ static unsigned long long checkIfReplMissingFromCommandLine(OperationContext* tx
  * start up or get promoted to be replica set primaries, newer nodes clear the temp flags left by
  * these versions.
  */
-static bool isSubjectToSERVER23299(OperationContext* txn) {
+bool isSubjectToSERVER23299(OperationContext* txn) {
+    // We are already called under global X lock as part of the startup sequence
+    invariant(txn->lockState()->isW());
+
     if (storageGlobalParams.readOnly) {
         return false;
     }
+
+    // Ensure that the local database is open since we are still early in the server startup
+    // sequence
     dbHolder().openDb(txn, startupLogCollectionName.db());
-    AutoGetCollectionForRead autoColl(txn, startupLogCollectionName);
+
+    // Only used as a shortcut to obtain a reference to the startup log collection
+    AutoGetCollection autoColl(txn, startupLogCollectionName, MODE_IS);
+
     // No startup log or an empty one means either that the user was not running an affected
     // version, or that they manually deleted the startup collection since they last started an
     // affected version.
@@ -313,7 +327,7 @@ static bool isSubjectToSERVER23299(OperationContext* txn) {
     return true;
 }
 
-static void handleSERVER23299ForDb(OperationContext* txn, Database* db) {
+void handleSERVER23299ForDb(OperationContext* txn, Database* db) {
     log() << "Scanning " << db->name() << " db for SERVER-23299 eligibility";
     const auto dbEntry = db->getDatabaseCatalogEntry();
     list<string> collNames;
@@ -334,8 +348,23 @@ static void handleSERVER23299ForDb(OperationContext* txn, Database* db) {
     log() << "Done scanning " << db->name() << " for SERVER-23299 eligibility";
 }
 
-static void repairDatabasesAndCheckVersion(OperationContext* txn) {
-    LOG(1) << "enter repairDatabases (to check pdfile version #)" << endl;
+/**
+ * Check that the oplog is capped, and abort the process if it is not.
+ * Caller must lock DB before calling this function.
+ */
+void checkForCappedOplog(OperationContext* txn, Database* db) {
+    const NamespaceString oplogNss(repl::rsOplogName);
+    invariant(txn->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
+    Collection* oplogCollection = db->getCollection(oplogNss);
+    if (oplogCollection && !oplogCollection->isCapped()) {
+        severe() << "The oplog collection " << oplogNss
+                 << " is not capped; a capped oplog is a requirement for replication to function.";
+        fassertFailedNoTrace(40115);
+    }
+}
+
+void repairDatabasesAndCheckVersion(OperationContext* txn) {
+    LOG(1) << "enter repairDatabases (to check pdfile version #)";
 
     ScopedTransaction transaction(txn, MODE_X);
     Lock::GlobalWrite lk(txn->lockState());
@@ -350,7 +379,7 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
         invariant(!storageGlobalParams.readOnly);
         for (vector<string>::const_iterator i = dbNames.begin(); i != dbNames.end(); ++i) {
             const string dbName = *i;
-            LOG(1) << "    Repairing database: " << dbName << endl;
+            LOG(1) << "    Repairing database: " << dbName;
 
             fassert(18506, repairDatabase(txn, storageEngine, dbName));
         }
@@ -370,7 +399,7 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
 
     for (vector<string>::const_iterator i = dbNames.begin(); i != dbNames.end(); ++i) {
         const string dbName = *i;
-        LOG(1) << "    Recovering database: " << dbName << endl;
+        LOG(1) << "    Recovering database: " << dbName;
 
         Database* db = dbHolder().openDb(txn, dbName);
         invariant(db);
@@ -389,11 +418,31 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
             }
             severe() << "Unable to start mongod due to an incompatibility with the data files and"
                         " this version of mongod: "
-                     << status;
+                     << redact(status);
             severe() << "Please consult our documentation when trying to downgrade to a previous"
                         " major release";
             quickExit(EXIT_NEED_UPGRADE);
             return;
+        }
+
+        // Check if admin.system.version contains an invalid featureCompatibilityVersion.
+        // If a valid featureCompatibilityVersion is present, cache it as a server parameter.
+        if (dbName == "admin") {
+            if (Collection* versionColl =
+                    db->getCollection(FeatureCompatibilityVersion::kCollection)) {
+                BSONObj featureCompatibilityVersion;
+                if (Helpers::findOne(txn,
+                                     versionColl,
+                                     BSON("_id" << FeatureCompatibilityVersion::kParameterName),
+                                     featureCompatibilityVersion)) {
+                    auto version = FeatureCompatibilityVersion::parse(featureCompatibilityVersion);
+                    if (!version.isOK()) {
+                        severe() << version.getStatus();
+                        fassertFailedNoTrace(40283);
+                    }
+                    serverGlobalParams.featureCompatibility.version.store(version.getValue());
+                }
+            }
         }
 
         // Major versions match, check indexes
@@ -422,7 +471,7 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
 
             const Status keyStatus = validateKeyPattern(key);
             if (!keyStatus.isOK()) {
-                log() << "Problem with index " << index << ": " << keyStatus.reason()
+                log() << "Problem with index " << index << ": " << redact(keyStatus)
                       << " This index can still be used however it cannot be rebuilt."
                       << " For more info see"
                       << " http://dochub.mongodb.org/core/index-validation" << startupWarningsLog;
@@ -446,7 +495,9 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
             checkForIdIndexes(txn, db);
             // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
             // collections)
-            repl::checkForCappedOplog(txn);
+            if (db->name() == "local") {
+                checkForCappedOplog(txn, db);
+            }
         }
 
         if (shouldDoCleanupForSERVER23299) {
@@ -459,21 +510,20 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
         }
     }
 
-    LOG(1) << "done repairDatabases" << endl;
+    LOG(1) << "done repairDatabases";
 }
 
-static void _initWireSpec() {
+void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
-    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incoming.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to any version
-    spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.outgoing.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
-
-static ExitCode _initAndListen(int listenPort) {
+ExitCode _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
 
     _initWireSpec();
@@ -506,7 +556,7 @@ static ExitCode _initAndListen(int listenPort) {
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
 #if defined(_WIN32)
-    printTargetMinOS();
+    VersionInfoInterface::instance().logTargetMinOS();
 #endif
 
     logProcessDetails();
@@ -517,13 +567,17 @@ static ExitCode _initAndListen(int listenPort) {
     options.port = listenPort;
     options.ipList = serverGlobalParams.bind_ip;
 
+    auto sep =
+        stdx::make_unique<ServiceEntryPointMongod>(getGlobalServiceContext()->getTransportLayer());
+    auto sepPtr = sep.get();
+
+    getGlobalServiceContext()->setServiceEntryPoint(std::move(sep));
+
     // Create, start, and attach the TL
-    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(
-        options,
-        std::make_shared<ServiceEntryPointMongod>(getGlobalServiceContext()->getTransportLayer()));
+    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(options, sepPtr);
     auto res = transportLayer->setup();
     if (!res.isOK()) {
-        error() << "Failed to set up listener: " << res.toString();
+        error() << "Failed to set up listener: " << res;
         return EXIT_NET_ERROR;
     }
 
@@ -626,7 +680,7 @@ static ExitCode _initAndListen(int listenPort) {
     repairDatabasesAndCheckVersion(startupOpCtx.get());
 
     if (storageGlobalParams.upgrade) {
-        log() << "finished checking dbs" << endl;
+        log() << "finished checking dbs";
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -645,26 +699,23 @@ static ExitCode _initAndListen(int listenPort) {
         web.detach();
     }
 
-    {
-#ifndef _WIN32
-        mongo::signalForkSuccess();
-#endif
-
+    AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
+    if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
         Status status = authindex::verifySystemIndexes(startupOpCtx.get());
         if (!status.isOK()) {
-            log() << status.reason();
+            log() << redact(status);
             exitCleanly(EXIT_NEED_UPGRADE);
         }
 
         // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
         int foundSchemaVersion;
-        status = getGlobalAuthorizationManager()->getAuthorizationVersion(startupOpCtx.get(),
-                                                                          &foundSchemaVersion);
+        status =
+            globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(), &foundSchemaVersion);
         if (!status.isOK()) {
             log() << "Auth schema version is incompatible: "
                   << "User and role management commands require auth data to have "
                   << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                  << " but startup could not verify schema version: " << status.toString() << endl;
+                  << " but startup could not verify schema version: " << status;
             exitCleanly(EXIT_NEED_UPGRADE);
         }
         if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
@@ -673,48 +724,41 @@ static ExitCode _initAndListen(int listenPort) {
                   << "at least schema version " << AuthorizationManager::schemaVersion26Final
                   << " but found " << foundSchemaVersion << ". In order to upgrade "
                   << "the auth schema, first downgrade MongoDB binaries to version "
-                  << "2.6 and then run the authSchemaUpgrade command." << endl;
+                  << "2.6 and then run the authSchemaUpgrade command.";
             exitCleanly(EXIT_NEED_UPGRADE);
         }
-
-        if (!storageGlobalParams.readOnly) {
-            getDeleter()->startWorkers();
-
-            restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
-
-            repl::getGlobalReplicationCoordinator()->startup(startupOpCtx.get());
-
-            const unsigned long long missingRepl =
-                checkIfReplMissingFromCommandLine(startupOpCtx.get());
-            if (missingRepl) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                      << " documents are present in local.system.replset" << startupWarningsLog;
-                log() << "**          Restart with --replSet unless you are doing maintenance and "
-                      << " no other clients are connected." << startupWarningsLog;
-                log() << "**          The TTL collection monitor will not start because of this."
-                      << startupWarningsLog;
-                log() << "**         ";
-                log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
-                log() << startupWarningsLog;
-            } else {
-                startTTLBackgroundJob();
-            }
-        }
+    } else if (globalAuthzManager->isAuthEnabled()) {
+        error() << "Auth must be disabled when starting without auth schema validation";
+        exitCleanly(EXIT_BADOPTIONS);
+    } else {
+        // If authSchemaValidation is disabled and server is running without auth,
+        // warn the user and continue startup without authSchema metadata checks.
+        log() << startupWarningsLog;
+        log() << "** WARNING: Startup auth schema validation checks are disabled for the "
+                 "database."
+              << startupWarningsLog;
+        log() << "**          This mode should only be used to manually repair corrupted auth "
+                 "data."
+              << startupWarningsLog;
     }
 
-    startClientCursorMonitor();
-
-    PeriodicTask::startRunningPeriodicTasks();
-
-    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
+    auto shardingInitialized =
+        uassertStatusOK(ShardingState::get(startupOpCtx.get())
+                            ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
+    if (shardingInitialized) {
+        reloadShardRegistryUntilSuccess(startupOpCtx.get());
+    }
 
     if (!storageGlobalParams.readOnly) {
-        startFTDC();
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-            uassertStatusOK(ShardingState::get(startupOpCtx.get())
-                                ->initializeFromShardIdentity(startupOpCtx.get()));
+        logStartup(startupOpCtx.get());
 
+        startFTDC();
+
+        getDeleter()->startWorkers();
+
+        restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
+
+        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
@@ -727,15 +771,41 @@ static ExitCode _initAndListen(int listenPort) {
             Balancer::create(startupOpCtx->getServiceContext());
         }
 
-        logStartup(startupOpCtx.get());
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        auto parseStatus = ShardIdentityType::fromBSON(serverGlobalParams.overrideShardIdentity);
-        uassertStatusOK(parseStatus);
-        uassertStatusOK(ShardingState::get(startupOpCtx.get())
-                            ->initializeFromShardIdentity(
-                                startupOpCtx.get(), parseStatus.getValue(), Date_t::max()));
-        uassertStatusOK(reloadShardRegistryUntilSuccess(startupOpCtx.get()));
+        repl::getGlobalReplicationCoordinator()->startup(startupOpCtx.get());
+
+        const unsigned long long missingRepl =
+            checkIfReplMissingFromCommandLine(startupOpCtx.get());
+        if (missingRepl) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: mongod started without --replSet yet " << missingRepl
+                  << " documents are present in local.system.replset" << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and "
+                  << " no other clients are connected." << startupWarningsLog;
+            log() << "**          The TTL collection monitor will not start because of this."
+                  << startupWarningsLog;
+            log() << "**         ";
+            log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
+            log() << startupWarningsLog;
+        } else {
+            startTTLBackgroundJob();
+        }
+
+        if (!replSettings.usingReplSets() && !replSettings.isSlave() &&
+            storageGlobalParams.engine != "devnull") {
+            ScopedTransaction transaction(startupOpCtx.get(), MODE_X);
+            Lock::GlobalWrite lk(startupOpCtx.get()->lockState());
+            FeatureCompatibilityVersion::setIfCleanStartup(
+                startupOpCtx.get(), repl::StorageInterface::get(getGlobalServiceContext()));
+        }
+
+        if (replSettings.usingReplSets() || (!replSettings.isMaster() && replSettings.isSlave())) {
+            serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(false);
+        }
     }
+
+    startClientCursorMonitor();
+
+    PeriodicTask::startRunningPeriodicTasks();
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
@@ -747,6 +817,10 @@ static ExitCode _initAndListen(int listenPort) {
         return EXIT_NET_ERROR;
     }
 
+#ifndef _WIN32
+    mongo::signalForkSuccess();
+#endif
+
     return waitForShutdown();
 }
 
@@ -754,24 +828,26 @@ ExitCode initAndListen(int listenPort) {
     try {
         return _initAndListen(listenPort);
     } catch (DBException& e) {
-        log() << "exception in initAndListen: " << e.toString() << ", terminating" << endl;
+        log() << "exception in initAndListen: " << e.toString() << ", terminating";
         return EXIT_UNCAUGHT;
     } catch (std::exception& e) {
         log() << "exception in initAndListen std::exception: " << e.what() << ", terminating";
         return EXIT_UNCAUGHT;
     } catch (int& n) {
-        log() << "exception in initAndListen int: " << n << ", terminating" << endl;
+        log() << "exception in initAndListen int: " << n << ", terminating";
         return EXIT_UNCAUGHT;
     } catch (...) {
-        log() << "exception in initAndListen, terminating" << endl;
+        log() << "exception in initAndListen, terminating";
         return EXIT_UNCAUGHT;
     }
 }
 
+}  // namespace
+
 #if defined(_WIN32)
 ExitCode initService() {
     ntservice::reportStatus(SERVICE_RUNNING);
-    log() << "Service running" << endl;
+    log() << "Service running";
     return initAndListen(serverGlobalParams.port);
 }
 #endif
@@ -959,49 +1035,65 @@ static void shutdownTask() {
         txn = uniqueTxn.get();
     }
 
-    getGlobalServiceContext()->getTransportLayer()->shutdown();
     log(LogComponent::kNetwork) << "shutdown: going to close listening sockets..." << endl;
     ListeningSockets::get()->closeAll();
 
     log(LogComponent::kNetwork) << "shutdown: going to flush diaglog..." << endl;
     _diaglog.flush();
 
+    if (txn) {
+        // This can wait a long time while we drain the secondary's apply queue, especially if it is
+        // building an index.
+        repl::ReplicationCoordinator::get(txn)->shutdown(txn);
+    }
+
     if (serviceContext)
         serviceContext->setKillAllOperations();
 
+    ReplicaSetMonitor::shutdown();
+    if (auto sr = grid.shardRegistry()) {  // TODO: race: sr is a naked pointer
+        sr->shutdown();
+    }
 #if __has_feature(address_sanitizer)
+    auto sep = static_cast<ServiceEntryPointMongod*>(serviceContext->getServiceEntryPoint());
 
-    // When running under address sanitizer, we get false positive leaks due to disorder around the
-    // lifecycle of a connection and request. When we are running under ASAN, we try a lot harder to
-    // dry up the server from active connections before going on to really shut down.
+    if (sep) {
+        // When running under address sanitizer, we get false positive leaks due to disorder around
+        // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
+        // harder to dry up the server from active connections before going on to really shut down.
 
-    log(LogComponent::kNetwork) << "shutdown: going to close all sockets because ASAN is active...";
+        log(LogComponent::kNetwork)
+            << "shutdown: going to close all sockets because ASAN is active...";
+        getGlobalServiceContext()->getTransportLayer()->shutdown();
 
-    // Close all sockets in a detached thread, and then wait for the number of active connections to
-    // reach zero. Give the detached background thread a 10 second deadline. If we haven't closed
-    // drained all active operations within that deadline, just keep going with shutdown: the OS
-    // will do it for us when the process terminates.
+        // Close all sockets in a detached thread, and then wait for the number of active
+        // connections to reach zero. Give the detached background thread a 10 second deadline. If
+        // we haven't closed drained all active operations within that deadline, just keep going
+        // with shutdown: the OS will do it for us when the process terminates.
 
-    stdx::packaged_task<void()> dryOutTask([] {
-        // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
-        // unfortunately. So, busy wait in this detached thread.
-        while (true) {
-            const auto connected = Listener::globalTicketHolder.used();
-            if (connected == 0) {
-                log(LogComponent::kNetwork) << "shutdown: no active connections found...";
-                break;
+        stdx::packaged_task<void()> dryOutTask([sep] {
+            // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
+            // unfortunately. So, busy wait in this detached thread.
+            while (true) {
+                const auto runningWorkers = sep->getNumberOfActiveWorkerThreads();
+
+                if (runningWorkers == 0) {
+                    log(LogComponent::kNetwork) << "shutdown: no running workers found...";
+                    break;
+                }
+                log(LogComponent::kNetwork) << "shutdown: still waiting on " << runningWorkers
+                                            << " active workers to drain... ";
+                mongo::sleepFor(Milliseconds(250));
             }
-            log(LogComponent::kNetwork) << "shutdown: still waiting on " << connected
-                                        << " active connections to drain... ";
-            mongo::sleepFor(Milliseconds(250));
-        }
-    });
+        });
 
-    auto dryNotification = dryOutTask.get_future();
-    stdx::thread(std::move(dryOutTask)).detach();
-    if (dryNotification.wait_for(Seconds(10).toSystemDuration()) != stdx::future_status::ready) {
-        log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
-                                    << " active connections to drain; continuing with shutdown... ";
+        auto dryNotification = dryOutTask.get_future();
+        stdx::thread(std::move(dryOutTask)).detach();
+        if (dryNotification.wait_for(Seconds(10).toSystemDuration()) !=
+            stdx::future_status::ready) {
+            log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
+                                        << " active workers to drain; continuing with shutdown... ";
+        }
     }
 
 #endif
@@ -1010,7 +1102,6 @@ static void shutdownTask() {
     stopFTDC();
 
     if (txn) {
-        repl::ReplicationCoordinator::get(txn)->shutdown(txn);
         ShardingState::get(txn)->shutDown(txn);
     }
 

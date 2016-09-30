@@ -117,7 +117,7 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
 
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
-                << ", stats: " << Explain::getWinningPlanStats(exec);
+                << ", stats: " << redact(Explain::getWinningPlanStats(exec));
 
         if (WorkingSetCommon::isValidStatusMemberObject(value)) {
             const Status errorStatus = WorkingSetCommon::getMemberObjectStatus(value);
@@ -413,6 +413,11 @@ public:
                 }
 
                 Collection* const collection = autoDb.getDb()->getCollection(nsString.ns());
+                if (!collection && autoDb.getDb()->getViewCatalog()->lookup(txn, nsString.ns())) {
+                    return appendCommandStatus(result,
+                                               {ErrorCodes::CommandNotSupportedOnView,
+                                                "findAndModify not supported on a view"});
+                }
                 auto statusWithPlanExecutor =
                     getExecutorDelete(txn, opDebug, collection, &parsedDelete);
                 if (!statusWithPlanExecutor.isOK()) {
@@ -485,6 +490,11 @@ public:
                 }
 
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
+                if (!collection && autoDb.getDb()->getViewCatalog()->lookup(txn, nsString.ns())) {
+                    return appendCommandStatus(result,
+                                               {ErrorCodes::CommandNotSupportedOnView,
+                                                "findAndModify not supported on a view"});
+                }
 
                 // Create the collection if it does not exist when performing an upsert
                 // because the update stage does not create its own collection.

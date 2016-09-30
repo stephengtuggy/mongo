@@ -38,7 +38,7 @@ using boost::intrusive_ptr;
 using std::vector;
 using std::string;
 
-REGISTER_DOCUMENT_SOURCE_ALIAS(count, DocumentSourceCount::createFromBson);
+REGISTER_MULTI_STAGE_ALIAS(count, DocumentSourceCount::createFromBson);
 
 vector<intrusive_ptr<DocumentSource>> DocumentSourceCount::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {

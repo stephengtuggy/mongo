@@ -42,11 +42,10 @@
 namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
-class ClientBasic;
 class CollatorInterface;
 class DocumentSource;
-struct ExpressionContext;
 class OperationContext;
+struct ExpressionContext;
 
 /**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
@@ -73,13 +72,6 @@ public:
      */
     static StatusWith<boost::intrusive_ptr<Pipeline>> create(
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Helper to implement Command::checkAuthForCommand.
-     */
-    static Status checkAuthForCommand(ClientBasic* client,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj);
 
     /**
      * Returns true if the provided aggregation command has a $out stage.
@@ -159,11 +151,10 @@ public:
     /// The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
 
-    /// The source that represents the output. Returns a non-owning pointer.
-    DocumentSource* output() {
-        invariant(!_sources.empty());
-        return _sources.back().get();
-    }
+    /**
+     * Returns the next result from the pipeline, or boost::none if there are no more results.
+     */
+    boost::optional<Document> getNext();
 
     /**
      * Write the pipeline's operators to a std::vector<Value>, with the
@@ -195,14 +186,12 @@ public:
 private:
     class Optimizations {
     public:
-        // These contain static functions that optimize pipelines in various ways.
-        // They are classes rather than namespaces so that they can be friends of Pipeline.
-        // Classes are defined in pipeline_optimizations.h.
-        class Local;
+        // This contains static functions that optimize pipelines in various ways.
+        // This is a class rather than a namespace so that it can be a friend of Pipeline.
+        // It is defined in pipeline_optimizations.h.
         class Sharded;
     };
 
-    friend class Optimizations::Local;
     friend class Optimizations::Sharded;
 
     Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);

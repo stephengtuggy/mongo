@@ -33,8 +33,6 @@
 #include "mongo/transport/service_entry_point_test_suite.h"
 
 #include <boost/optional.hpp>
-#include <unordered_map>
-#include <unordered_set>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -44,6 +42,8 @@
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/ticket.h"
@@ -51,6 +51,7 @@
 #include "mongo/transport/transport_layer.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
@@ -90,6 +91,7 @@ void setPingCommand(Message* m) {
 
 // Some default method implementations
 const auto kDefaultEnd = [](const Session& session) { return; };
+const auto kDefaultDestroyHook = [](Session& session) { return; };
 const auto kDefaultAsyncWait = [](Ticket, TicketCallback cb) { cb(Status::OK()); };
 const auto kNoopFunction = [] { return; };
 
@@ -127,13 +129,13 @@ ServiceEntryPointTestSuite::MockTLHarness::MockTLHarness()
       _asyncWait(kDefaultAsyncWait),
       _end(kDefaultEnd) {}
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::sourceMessage(const Session& session,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::sourceMessage(Session& session,
                                                                 Message* message,
                                                                 Date_t expiration) {
     return _sourceMessage(session, message, expiration);
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::sinkMessage(const Session& session,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::sinkMessage(Session& session,
                                                               const Message& message,
                                                               Date_t expiration) {
     return _sinkMessage(session, message, expiration);
@@ -148,8 +150,9 @@ void ServiceEntryPointTestSuite::MockTLHarness::asyncWait(Ticket&& ticket,
     return _asyncWait(std::move(ticket), std::move(callback));
 }
 
-std::string ServiceEntryPointTestSuite::MockTLHarness::getX509SubjectName(const Session& session) {
-    return "mock";
+SSLPeerInfo ServiceEntryPointTestSuite::MockTLHarness::getX509PeerInfo(
+    const Session& session) const {
+    return SSLPeerInfo("mock", stdx::unordered_set<RoleName>{});
 }
 
 void ServiceEntryPointTestSuite::MockTLHarness::registerTags(const Session& session) {}
@@ -158,7 +161,7 @@ TransportLayer::Stats ServiceEntryPointTestSuite::MockTLHarness::sessionStats() 
     return Stats();
 }
 
-void ServiceEntryPointTestSuite::MockTLHarness::end(const Session& session) {
+void ServiceEntryPointTestSuite::MockTLHarness::end(Session& session) {
     return _end(session);
 }
 
@@ -191,19 +194,17 @@ Status ServiceEntryPointTestSuite::MockTLHarness::_waitOnceThenError(transport::
     return _defaultWait(std::move(ticket));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSource(const Session& s,
-                                                                 Message* m,
-                                                                 Date_t d) {
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSource(Session& s, Message* m, Date_t d) {
     return Ticket(this, stdx::make_unique<ServiceEntryPointTestSuite::MockTicket>(s, m, d));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSink(const Session& s,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSink(Session& s,
                                                                const Message&,
                                                                Date_t d) {
     return Ticket(this, stdx::make_unique<ServiceEntryPointTestSuite::MockTicket>(s, d));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_sinkThenErrorOnWait(const Session& s,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_sinkThenErrorOnWait(Session& s,
                                                                        const Message& m,
                                                                        Date_t d) {
     _wait = stdx::bind(&ServiceEntryPointTestSuite::MockTLHarness::_waitOnceThenError, this, _1);
@@ -218,11 +219,16 @@ void ServiceEntryPointTestSuite::MockTLHarness::_resetHooks() {
     _wait = stdx::bind(&ServiceEntryPointTestSuite::MockTLHarness::_defaultWait, this, _1);
     _asyncWait = kDefaultAsyncWait;
     _end = kDefaultEnd;
+    _destroy_hook = kDefaultDestroyHook;
 }
 
 ServiceEntryPointTestSuite::MockTicket* ServiceEntryPointTestSuite::MockTLHarness::getMockTicket(
     const transport::Ticket& ticket) {
     return dynamic_cast<ServiceEntryPointTestSuite::MockTicket*>(getTicketImpl(ticket));
+}
+
+void ServiceEntryPointTestSuite::MockTLHarness::_destroy(Session& session) {
+    return _destroy_hook(session);
 }
 
 void ServiceEntryPointTestSuite::setUp() {
@@ -245,7 +251,7 @@ void ServiceEntryPointTestSuite::noLifeCycleTest() {
     _tl->_wait = stdx::bind(&ServiceEntryPointTestSuite::MockTLHarness::_waitError, _tl.get(), _1);
 
     // Step 3: SEP destroys the session, which calls end()
-    _tl->_end = [&testComplete](const Session&) { testComplete.set_value(); };
+    _tl->_destroy_hook = [&testComplete](const Session&) { testComplete.set_value(); };
 
     // Kick off the SEP
     Session s(HostAndPort(), HostAndPort(), _tl.get());
@@ -264,7 +270,7 @@ void ServiceEntryPointTestSuite::halfLifeCycleTest() {
     // Step 1: SEP gets a ticket to source a Message
     // Step 2: SEP calls wait() on the ticket and receives a Message
     // Step 3: SEP gets a ticket to sink a Message
-    _tl->_sinkMessage = [this](const Session& session, const Message& m, Date_t expiration) {
+    _tl->_sinkMessage = [this](Session& session, const Message& m, Date_t expiration) {
 
         // Step 4: SEP calls wait() on the ticket and receives an error
         _tl->_wait =
@@ -274,7 +280,7 @@ void ServiceEntryPointTestSuite::halfLifeCycleTest() {
     };
 
     // Step 5: SEP destroys the session, which calls end()
-    _tl->_end = [&testComplete](const Session&) { testComplete.set_value(); };
+    _tl->_destroy_hook = [&testComplete](const Session&) { testComplete.set_value(); };
 
     // Kick off the SEP
     Session s(HostAndPort(), HostAndPort(), _tl.get());
@@ -300,7 +306,7 @@ void ServiceEntryPointTestSuite::fullLifeCycleTest() {
     // Step 5: SEP gets a ticket to source a Message
     // Step 6: SEP calls wait() on the ticket and receives and error
     // Step 7: SEP destroys the session, which calls end()
-    _tl->_end = [&testComplete](const Session& session) { testComplete.set_value(); };
+    _tl->_destroy_hook = [&testComplete](const Session& session) { testComplete.set_value(); };
 
     // Kick off the SEP
     Session s(HostAndPort(), HostAndPort(), _tl.get());
@@ -354,7 +360,7 @@ void ServiceEntryPointTestSuite::interruptingSessionTest() {
     // Step 7: SEP calls sourceMessage() for B, gets tB3
     // Step 8: SEP calls wait() for tB3, gets an error
     // Step 9: SEP calls end(B)
-    _tl->_end = [this, idA, idB, &resumeA, &testComplete](const Session& session) {
+    _tl->_destroy_hook = [this, idA, idB, &resumeA, &testComplete](const Session& session) {
 
         // When end(B) is called, time to resume session A
         if (session.id() == idB) {
@@ -395,7 +401,7 @@ void ServiceEntryPointTestSuite::burstStressTest(int numSessions,
     auto allCompleteFuture = allSessionsComplete.get_future();
 
     stdx::mutex cyclesLock;
-    std::unordered_map<Session::Id, int> completedCycles;
+    stdx::unordered_map<Session::Id, int> completedCycles;
 
     _tl->_resetHooks();
 
@@ -442,7 +448,7 @@ void ServiceEntryPointTestSuite::burstStressTest(int numSessions,
     };
 
     // When we end the last session, end the test.
-    _tl->_end = [&allSessionsComplete, numSessions, &ended](const Session& session) {
+    _tl->_destroy_hook = [&allSessionsComplete, numSessions, &ended](const Session& session) {
         if (ended.fetchAndAdd(1) == (numSessions - 1)) {
             allSessionsComplete.set_value();
         }

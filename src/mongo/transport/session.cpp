@@ -32,6 +32,7 @@
 
 #include "mongo/platform/atomic_word.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace transport {
@@ -51,7 +52,7 @@ Session::Session(HostAndPort remote, HostAndPort local, TransportLayer* tl)
 
 Session::~Session() {
     if (_tl != nullptr) {
-        _tl->end(*this);
+        _tl->_destroy(*this);
     }
 }
 
@@ -60,7 +61,7 @@ Session::Session(Session&& other)
       _remote(std::move(other._remote)),
       _local(std::move(other._local)),
       _tl(other._tl) {
-    // We do not want to call tl->end() on moved-from Sessions.
+    // We do not want to call tl->destroy() on moved-from Sessions.
     other._tl = nullptr;
 }
 
@@ -91,8 +92,8 @@ Ticket Session::sinkMessage(const Message& message, Date_t expiration) {
     return _tl->sinkMessage(*this, message, expiration);
 }
 
-std::string Session::getX509SubjectName() const {
-    return _tl->getX509SubjectName(*this);
+SSLPeerInfo Session::getX509PeerInfo() const {
+    return _tl->getX509PeerInfo(*this);
 }
 
 }  // namespace transport

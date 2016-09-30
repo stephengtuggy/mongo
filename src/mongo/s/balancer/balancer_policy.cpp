@@ -32,6 +32,7 @@
 
 #include "mongo/s/balancer/balancer_policy.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/util/log.h"
@@ -55,7 +56,9 @@ const size_t kAggressiveImbalanceThreshold = 1;
 }  // namespace
 
 DistributionStatus::DistributionStatus(NamespaceString nss, ShardToChunksMap shardToChunksMap)
-    : _nss(std::move(nss)), _shardChunks(std::move(shardToChunksMap)) {}
+    : _nss(std::move(nss)),
+      _shardChunks(std::move(shardToChunksMap)),
+      _zoneRanges(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<ZoneRange>()) {}
 
 size_t DistributionStatus::totalChunks() const {
     size_t total = 0;
@@ -104,32 +107,50 @@ const vector<ChunkType>& DistributionStatus::getChunks(const ShardId& shardId) c
     return i->second;
 }
 
-bool DistributionStatus::addTagRange(const TagRange& range) {
-    const auto minIntersect = _tagRanges.upper_bound(range.min);
-    const auto maxIntersect = _tagRanges.upper_bound(range.max);
+Status DistributionStatus::addRangeToZone(const ZoneRange& range) {
+    const auto minIntersect = _zoneRanges.upper_bound(range.min);
+    const auto maxIntersect = _zoneRanges.upper_bound(range.max);
 
     // Check for partial overlap
     if (minIntersect != maxIntersect) {
-        return false;
+        invariant(minIntersect != _zoneRanges.end());
+        const auto& intersectingRange =
+            (SimpleBSONObjComparator::kInstance.evaluate(minIntersect->second.min < range.max))
+            ? minIntersect->second
+            : maxIntersect->second;
+
+        if (SimpleBSONObjComparator::kInstance.evaluate(intersectingRange.min == range.min) &&
+            SimpleBSONObjComparator::kInstance.evaluate(intersectingRange.max == range.max) &&
+            intersectingRange.zone == range.zone) {
+            return Status::OK();
+        }
+
+        return {ErrorCodes::RangeOverlapConflict,
+                str::stream() << "Zone range: " << range.toString()
+                              << " is overlapping with existing: "
+                              << intersectingRange.toString()};
     }
 
     // Check for containment
-    if (minIntersect != _tagRanges.end()) {
-        const TagRange& nextRange = minIntersect->second;
-        if (range.max > nextRange.min) {
-            invariant(range.max < nextRange.max);
-            return false;
+    if (minIntersect != _zoneRanges.end()) {
+        const ZoneRange& nextRange = minIntersect->second;
+        if (SimpleBSONObjComparator::kInstance.evaluate(range.max > nextRange.min)) {
+            invariant(SimpleBSONObjComparator::kInstance.evaluate(range.max < nextRange.max));
+            return {ErrorCodes::RangeOverlapConflict,
+                    str::stream() << "Zone range: " << range.toString()
+                                  << " is overlapping with existing: "
+                                  << nextRange.toString()};
         }
     }
 
-    _tagRanges[range.max.getOwned()] = range;
-    _allTags.insert(range.tag);
-    return true;
+    _zoneRanges[range.max.getOwned()] = range;
+    _allTags.insert(range.zone);
+    return Status::OK();
 }
 
 string DistributionStatus::getTagForChunk(const ChunkType& chunk) const {
-    const auto minIntersect = _tagRanges.upper_bound(chunk.getMin());
-    const auto maxIntersect = _tagRanges.lower_bound(chunk.getMax());
+    const auto minIntersect = _zoneRanges.upper_bound(chunk.getMin());
+    const auto maxIntersect = _zoneRanges.lower_bound(chunk.getMax());
 
     // We should never have a partial overlap with a chunk range. If it happens, treat it as if this
     // chunk doesn't belong to a tag
@@ -137,15 +158,16 @@ string DistributionStatus::getTagForChunk(const ChunkType& chunk) const {
         return "";
     }
 
-    if (minIntersect == _tagRanges.end()) {
+    if (minIntersect == _zoneRanges.end()) {
         return "";
     }
 
-    const TagRange& intersectRange = minIntersect->second;
+    const ZoneRange& intersectRange = minIntersect->second;
 
     // Check for containment
-    if (intersectRange.min <= chunk.getMin() && chunk.getMax() <= intersectRange.max) {
-        return intersectRange.tag;
+    if (SimpleBSONObjComparator::kInstance.evaluate(intersectRange.min <= chunk.getMin()) &&
+        SimpleBSONObjComparator::kInstance.evaluate(chunk.getMax() <= intersectRange.max)) {
+        return intersectRange.zone;
     }
 
     return "";
@@ -177,9 +199,9 @@ void DistributionStatus::report(BSONObjBuilder* builder) const {
 
     // Report all tag ranges
     BSONArrayBuilder tagRangesArr(builder->subarrayStart("tagRanges"));
-    for (const auto& tagRange : _tagRanges) {
+    for (const auto& tagRange : _zoneRanges) {
         BSONObjBuilder tagRangeEntry(tagRangesArr.subobjStart());
-        tagRangeEntry.append("tag", tagRange.second.tag);
+        tagRangeEntry.append("tag", tagRange.second.zone);
         tagRangeEntry.append("mapKey", tagRange.first);
         tagRangeEntry.append("min", tagRange.second.min);
         tagRangeEntry.append("max", tagRange.second.max);
@@ -304,7 +326,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     _getLeastLoadedReceiverShard(shardStats, distribution, tag, usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
-                        warning() << "Chunk " << chunk
+                        warning() << "Chunk " << redact(chunk.toString())
                                   << " is on a draining shard, but no appropriate recipient found";
                     }
                     continue;
@@ -337,8 +359,8 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     continue;
 
                 if (chunk.getJumbo()) {
-                    warning() << "chunk " << chunk << " violates tag " << tag
-                              << ", but it is jumbo and cannot be moved";
+                    warning() << "chunk " << redact(chunk.toString()) << " violates tag "
+                              << redact(tag) << ", but it is jumbo and cannot be moved";
                     continue;
                 }
 
@@ -346,8 +368,8 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     _getLeastLoadedReceiverShard(shardStats, distribution, tag, usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
-                        warning() << "chunk " << chunk << " violates tag " << tag
-                                  << ", but no appropriate recipient found";
+                        warning() << "chunk " << redact(chunk.toString()) << " violates tag "
+                                  << redact(tag) << ", but no appropriate recipient found";
                     }
                     continue;
                 }
@@ -384,7 +406,8 @@ boost::optional<MigrateInfo> BalancerPolicy::balanceSingleChunk(
     const DistributionStatus& distribution) {
     const string tag = distribution.getTagForChunk(chunk);
 
-    ShardId newShardId = _getLeastLoadedReceiverShard(shardStats, distribution, tag, {});
+    ShardId newShardId =
+        _getLeastLoadedReceiverShard(shardStats, distribution, tag, set<ShardId>());
     if (!newShardId.isValid() || newShardId == chunk.getShard()) {
         return boost::optional<MigrateInfo>();
     }
@@ -433,11 +456,10 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
     invariant(totalNumberOfShardsWithTag);
     invariant(totalNumberOfChunksWithTag >= max);
 
-    // The ideal should be at least one per shard
+    // Calculate the ceiling of the optimal number of chunks per shard
     const size_t idealNumberOfChunksPerShardWithTag =
-        (totalNumberOfChunksWithTag < totalNumberOfShardsWithTag)
-        ? 1
-        : (totalNumberOfChunksWithTag / totalNumberOfShardsWithTag);
+        (totalNumberOfChunksWithTag / totalNumberOfShardsWithTag) +
+        (totalNumberOfChunksWithTag % totalNumberOfShardsWithTag ? 1 : 0);
 
     const size_t imbalance = max - idealNumberOfChunksPerShardWithTag;
 
@@ -480,8 +502,8 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
     return false;
 }
 
-string TagRange::toString() const {
-    return str::stream() << min << " -->> " << max << "  on  " << tag;
+string ZoneRange::toString() const {
+    return str::stream() << min << " -->> " << max << "  on  " << zone;
 }
 
 std::string MigrateInfo::getName() const {

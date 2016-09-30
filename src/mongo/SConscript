@@ -65,9 +65,11 @@ baseSource=[
     'base/initializer_dependency_graph.cpp',
     'base/make_string_vector.cpp',
     'base/parse_number.cpp',
+    'base/simple_string_data_comparator.cpp',
     'base/status.cpp',
     'base/string_data.cpp',
     'base/validate_locale.cpp',
+    'bson/bson_comparator_interface_base.cpp',
     'bson/bson_validate.cpp',
     'bson/bsonelement.cpp',
     'bson/bsonmisc.cpp',
@@ -76,6 +78,8 @@ baseSource=[
     'bson/bsontypes.cpp',
     'bson/json.cpp',
     'bson/oid.cpp',
+    'bson/simple_bsonelement_comparator.cpp',
+    'bson/simple_bsonobj_comparator.cpp',
     'bson/timestamp.cpp',
     'logger/component_message_log_domain.cpp',
     'logger/console.cpp',
@@ -124,6 +128,7 @@ baseLibDeps=[
     '$BUILD_DIR/third_party/shim_pcrecpp',
     '$BUILD_DIR/third_party/shim_intel_decimal128',
     '$BUILD_DIR/third_party/shim_tz',
+    'logger/max_log_size',
     'util/debugger',
     'util/quick_exit',
 ]
@@ -194,7 +199,7 @@ for tup in env['MONGO_BUILDINFO_ENVIRONMENT_DATA']:
 buildInfoInitializer = '{{ {0} }}'.format(', '.join(buildInfoInitializer))
 
 generatedVersionFile = env.Substfile(
-    'util/version.cpp.in',
+    'util/version_constants.h.in',
     SUBST_DICT=[
         ('@mongo_version@', env['MONGO_VERSION']),
         ('@mongo_version_major@', version_parts[0]),
@@ -228,6 +233,7 @@ config_header_substs = (
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
+    ('@mongo_config_ssl_has_asn1_any_definitions@', 'MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS'),
     ('@mongo_config_wiredtiger_enabled@', 'MONGO_CONFIG_WIREDTIGER_ENABLED'),
 )
 
@@ -251,13 +257,16 @@ mongodLibDeps = [
     "db/mongodandmongos",
     "db/mongodwebserver",
     "db/serveronly",
+    "db/repl/replset_commands",
     "db/repl/storage_interface_impl",
     "executor/network_interface_factory",
     's/commands/shared_cluster_commands',
     "transport/transport_layer_legacy",
     "transport/service_entry_point_utils",
     "util/clock_sources",
+    "util/fail_point",
     "util/ntservice",
+    "util/version_impl",
 ]
 
 if has_option('use-cpu-profiler'):
@@ -316,8 +325,10 @@ env.Install(
             'transport/service_entry_point_utils',
             'transport/transport_layer_legacy',
             'util/clock_sources',
+            'util/fail_point',
             'util/ntservice',
             'util/options_parser/options_parser_init',
+            'util/version_impl',
         ]))
 
 env.Library("linenoise_utf8",
@@ -370,10 +381,12 @@ if not has_option('noshell') and usemozjs:
                     'rpc/protocol',
                     'scripting/scripting',
                     'shell/mongojs',
+                    'transport/message_compressor',
                     'util/net/network',
                     'util/options_parser/options_parser_init',
                     'util/processinfo',
                     'util/signal_handlers',
+                    'util/version_impl',
                     'executor/thread_pool_task_executor',
                     'executor/network_interface_thread_pool',
                     'executor/network_interface_factory'

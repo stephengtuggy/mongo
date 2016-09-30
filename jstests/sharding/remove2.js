@@ -76,15 +76,6 @@ var conn = new Mongo(st.s.host);
 var coll = conn.getCollection("test.remove2");
 coll.drop();
 
-// Decrease how long it will take for rst0 to time out its ReplicaSetMonitor for rst1 when rs1 is
-// shut down
-for (var i = 0; i < rst0.nodes.length; i++) {
-    node = rst0.nodes[i];
-    res = node.getDB('admin').runCommand({setParameter: 1, replMonitorMaxFailedChecks: 1});
-    printjson(res);
-    assert(res.ok);
-}
-
 st.admin.runCommand({enableSharding: coll.getDB().getName()});
 st.ensurePrimaryShard(coll.getDB().getName(), 'test-rs0');
 st.admin.runCommand({shardCollection: coll.getFullName(), key: {i: 1}});
@@ -127,7 +118,7 @@ rst1.stopSet();
 print("Sleeping for 20 seconds to let the other shard's ReplicaSetMonitor time out");
 sleep(20000);  // 1 failed check should take 10 seconds, sleep for 20 just to be safe
 
-rst1.startSet();
+rst1.startSet({restart: true});
 rst1.initiate();
 rst1.awaitReplication();
 
@@ -171,11 +162,11 @@ assert( conn.getDB('test2').dropDatabase().ok );*/
 jsTestLog("Attempt removing shard and adding a new shard with the same Replica Set name");
 removeShard(st, rst1);
 rst1.stopSet();
-print("Sleeping for 20 seconds to let the other shard's ReplicaSetMonitor time out");
-sleep(20000);
+print("Sleeping for 60 seconds to let the other shards restart their ReplicaSetMonitors");
+sleep(60000);
 
 var rst2 = new ReplSetTest({name: rst1.name, nodes: 2, useHostName: true});
-rst2.startSet();
+rst2.startSet({shardsvr: ""});
 rst2.initiate();
 rst2.awaitReplication();
 
@@ -192,8 +183,10 @@ jsTestLog("Putting ShardingTest back to state it expects");
 printjson(st.admin.runCommand({movePrimary: 'test2', to: rst0.name}));
 removeShard(st, rst2);
 rst2.stopSet();
+print("Sleeping for 60 seconds to let the other shards restart their ReplicaSetMonitors");
+sleep(60000);
 
-rst1.startSet();
+rst1.startSet({restart: true});
 rst1.initiate();
 rst1.awaitReplication();
 

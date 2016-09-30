@@ -94,6 +94,12 @@ public:
              int options,
              string& errmsg,
              BSONObjBuilder& result) {
+
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+            uassertStatusOK({ErrorCodes::NoShardingEnabled,
+                             "Cannot accept sharding commands if not started with --shardsvr"});
+        }
+
         // Steps
         // 1. check basic config
         // 2. extract params from command
@@ -148,8 +154,8 @@ public:
 
             // TODO: SERVER-21397 remove post v3.3.
             // Send back wire version to let mongos know what protocol we can speak
-            result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
-            result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
+            result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
+            result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
 
             return true;
         }
@@ -183,9 +189,17 @@ public:
         connectionVersion.addToBSON(result, "oldVersion");
 
         {
-            // Use a stable collection metadata while performing the checks
-            boost::optional<AutoGetCollection> autoColl;
-            autoColl.emplace(txn, nss, MODE_IS);
+            boost::optional<AutoGetDb> autoDb;
+            autoDb.emplace(txn, nss.db(), MODE_IS);
+
+            // Views do not require a shard version check.
+            if (autoDb->getDb() && !autoDb->getDb()->getCollection(nss.ns()) &&
+                autoDb->getDb()->getViewCatalog()->lookup(txn, nss.ns())) {
+                return true;
+            }
+
+            boost::optional<Lock::CollectionLock> collLock;
+            collLock.emplace(txn->lockState(), nss.ns(), MODE_IS);
 
             auto css = CollectionShardingState::get(txn, nss);
             const ChunkVersion collectionShardVersion =
@@ -248,7 +262,8 @@ public:
                         auto critSecSignal =
                             css->getMigrationSourceManager()->getMigrationCriticalSectionSignal();
                         if (critSecSignal) {
-                            autoColl.reset();
+                            collLock.reset();
+                            autoDb.reset();
                             log() << "waiting till out of critical section";
                             critSecSignal->waitFor(txn, Seconds(10));
                         }
@@ -270,7 +285,8 @@ public:
                         auto critSecSignal =
                             css->getMigrationSourceManager()->getMigrationCriticalSectionSignal();
                         if (critSecSignal) {
-                            autoColl.reset();
+                            collLock.reset();
+                            autoDb.reset();
                             log() << "waiting till out of critical section";
                             critSecSignal->waitFor(txn, Seconds(10));
                         }
@@ -304,7 +320,7 @@ public:
                 errmsg = str::stream()
                     << "could not refresh metadata for " << ns << " with requested shard version "
                     << requestedVersion.toString() << ", stored shard version is "
-                    << currVersion.toString() << causedBy(status.reason());
+                    << currVersion.toString() << causedBy(redact(status));
 
                 warning() << errmsg;
 

@@ -46,14 +46,14 @@ const char* DocumentSourceGeoNear::getSourceName() const {
     return "$geoNear";
 }
 
-boost::optional<Document> DocumentSourceGeoNear::getNext() {
+DocumentSource::GetNextResult DocumentSourceGeoNear::getNext() {
     pExpCtx->checkForInterrupt();
 
     if (!resultsIterator)
         runCommand();
 
     if (!resultsIterator->more())
-        return boost::none;
+        return GetNextResult::makeEOF();
 
     // each result from the geoNear command is wrapped in a wrapper object with "obj",
     // "dis" and maybe "loc" fields. We want to take the object from "obj" and inject the
@@ -144,6 +144,12 @@ BSONObj DocumentSourceGeoNear::buildGeoNearCmd() const {
         geoNear.append("minDistance", minDistance);
 
     geoNear.append("query", query);
+    if (pExpCtx->getCollator()) {
+        geoNear.append("collation", pExpCtx->getCollator()->getSpec().toBSON());
+    } else {
+        geoNear.append("collation", CollationSpec::kSimpleSpec);
+    }
+
     geoNear.append("spherical", spherical);
     geoNear.append("distanceMultiplier", distanceMultiplier);
 
@@ -222,6 +228,13 @@ void DocumentSourceGeoNear::parseOptions(BSONObj options) {
 
     if (options.hasField("uniqueDocs"))
         warning() << "ignoring deprecated uniqueDocs option in $geoNear aggregation stage";
+
+    // The collation field is disallowed, even though it is accepted by the geoNear command, since
+    // the $geoNear operation should respect the collation associated with the entire pipeline.
+    uassert(40227,
+            "$geoNear does not accept the 'collation' parameter. Instead, specify a collation "
+            "for the entire aggregation command.",
+            !options["collation"]);
 }
 
 DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext>& pExpCtx)

@@ -28,11 +28,10 @@
 
 #pragma once
 
-#include <unordered_map>
-
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/ticket_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/listen.h"
@@ -60,18 +59,18 @@ public:
         Options() : port(0), ipList("") {}
     };
 
-    TransportLayerLegacy(const Options& opts, std::shared_ptr<ServiceEntryPoint> sep);
+    TransportLayerLegacy(const Options& opts, ServiceEntryPoint* sep);
 
     ~TransportLayerLegacy();
 
     Status setup();
     Status start() override;
 
-    Ticket sourceMessage(const Session& session,
+    Ticket sourceMessage(Session& session,
                          Message* message,
                          Date_t expiration = Ticket::kNoExpirationDate) override;
 
-    Ticket sinkMessage(const Session& session,
+    Ticket sinkMessage(Session& session,
                        const Message& message,
                        Date_t expiration = Ticket::kNoExpirationDate) override;
 
@@ -79,15 +78,18 @@ public:
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
     void registerTags(const Session& session) override;
-    std::string getX509SubjectName(const Session& session) override;
+    SSLPeerInfo getX509PeerInfo(const Session& session) const override;
 
     Stats sessionStats() override;
 
-    void end(const Session& session) override;
-    void endAllSessions(transport::Session::TagMask tags = Session::kKeepOpen) override;
+    void end(Session& session) override;
+    void endAllSessions(transport::Session::TagMask tags) override;
+
     void shutdown() override;
 
 private:
+    void _destroy(Session& session) override;
+
     void _handleNewConnection(std::unique_ptr<AbstractMessagingPort> amp);
 
     Status _runTicket(Ticket ticket);
@@ -139,29 +141,25 @@ private:
      */
     struct Connection {
         Connection(std::unique_ptr<AbstractMessagingPort> port, bool ended, Session::TagMask tags)
-            : amp(std::move(port)),
-              connectionId(amp->connectionId()),
-              tags(tags),
-              inUse(false),
-              ended(false) {}
+            : amp(std::move(port)), connectionId(amp->connectionId()), tags(tags) {}
 
         std::unique_ptr<AbstractMessagingPort> amp;
 
         const long long connectionId;
 
-        boost::optional<std::string> x509SubjectName;
+        boost::optional<SSLPeerInfo> sslPeerInfo;
         Session::TagMask tags;
-        bool inUse;
-        bool ended;
+        bool inUse = false;
+        bool ended = false;
     };
 
-    std::shared_ptr<ServiceEntryPoint> _sep;
+    ServiceEntryPoint* _sep;
 
     std::unique_ptr<Listener> _listener;
     stdx::thread _listenerThread;
 
-    stdx::mutex _connectionsMutex;
-    std::unordered_map<Session::Id, Connection> _connections;
+    mutable stdx::mutex _connectionsMutex;
+    stdx::unordered_map<Session::Id, Connection> _connections;
 
     void _endSession_inlock(decltype(_connections.begin()) conn);
 

@@ -37,6 +37,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -88,6 +89,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
@@ -311,7 +313,7 @@ public:
         return false;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
@@ -438,7 +440,7 @@ public:
         int was = _diaglog.setLevel(cmdObj.firstElement().numberInt());
         _diaglog.flush();
         if (!serverGlobalParams.quiet) {
-            LOG(0) << "CMD: diagLogging set to " << _diaglog.getLevel() << " from: " << was << endl;
+            LOG(0) << "CMD: diagLogging set to " << _diaglog.getLevel() << " from: " << was;
         }
         result.append("was", was);
         result.append("note", deprecationWarning);
@@ -517,27 +519,13 @@ public:
         help << "create a collection explicitly\n"
                 "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        if (cmdObj["capped"].trueValue()) {
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    parseResourcePattern(dbname, cmdObj), ActionType::convertToCapped)) {
-                return Status(ErrorCodes::Unauthorized, "unauthorized");
-            }
-        }
-
-        // ActionType::createCollection or ActionType::insert are both acceptable
-        if (authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
-                                                           ActionType::createCollection) ||
-            authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
-                                                           ActionType::insert)) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj);
     }
+
     virtual bool run(OperationContext* txn,
                      const string& dbname,
                      BSONObj& cmdObj,
@@ -550,6 +538,18 @@ public:
             warning() << deprecationWarning;
             result.append("note", deprecationWarning);
         }
+
+        auto featureCompatibilityVersion = serverGlobalParams.featureCompatibility.version.load();
+        if (ServerGlobalParams::FeatureCompatibility::Version::k32 == featureCompatibilityVersion &&
+            cmdObj.hasField("collation")) {
+            return appendCommandStatus(
+                result,
+                {ErrorCodes::InvalidOptions,
+                 "The featureCompatibilityVersion must be 3.4 to create a collection or "
+                 "view with a default collation. See "
+                 "http://dochub.mongodb.org/core/3.4-feature-compatibility."});
+        }
+
         return appendCommandStatus(result, createCollection(txn, dbname, cmdObj));
     }
 } cmdCreate;
@@ -662,7 +662,7 @@ public:
                     if (partialOk) {
                         break;  // skipped chunk is probably on another shard
                     }
-                    log() << "should have chunk: " << n << " have:" << myn << endl;
+                    log() << "should have chunk: " << n << " have:" << myn;
                     dumpChunks(txn, ns, query, sort);
                     uassert(10040, "chunks out of order", n == myn);
                 }
@@ -783,8 +783,12 @@ public:
         AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
+        long long numRecords = 0;
+        if (collection) {
+            numRecords = collection->numRecords(txn);
+        }
 
-        if (!collection || collection->numRecords(txn) == 0) {
+        if (numRecords == 0) {
             result.appendNumber("size", 0);
             result.appendNumber("numObjects", 0);
             result.append("millis", timer.millis());
@@ -797,8 +801,7 @@ public:
         if (min.isEmpty() && max.isEmpty()) {
             if (estimate) {
                 result.appendNumber("size", static_cast<long long>(collection->dataSize(txn)));
-                result.appendNumber("numObjects",
-                                    static_cast<long long>(collection->numRecords(txn)));
+                result.appendNumber("numObjects", numRecords);
                 result.append("millis", timer.millis());
                 return 1;
             }
@@ -831,11 +834,11 @@ public:
                                               idx,
                                               min,
                                               max,
-                                              false,  // endKeyInclusive
+                                              BoundInclusion::kIncludeStartKeyOnly,
                                               PlanExecutor::YIELD_MANUAL);
         }
 
-        long long avgObjSize = collection->dataSize(txn) / collection->numRecords(txn);
+        long long avgObjSize = collection->dataSize(txn) / numRecords;
 
         long long maxSize = jsobj["maxSize"].numberLong();
         long long maxObjects = jsobj["maxObjects"].numberLong();
@@ -861,7 +864,7 @@ public:
         }
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            warning() << "Internal error while reading " << ns << endl;
+            warning() << "Internal error while reading " << ns;
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::OperationFailed,
@@ -913,20 +916,6 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        int scale = 1;
-        if (jsobj["scale"].isNumber()) {
-            scale = jsobj["scale"].numberInt();
-            if (scale <= 0) {
-                errmsg = "scale has to be >= 1";
-                return false;
-            }
-        } else if (jsobj["scale"].trueValue()) {
-            errmsg = "scale has to be a number >= 1";
-            return false;
-        }
-
-        bool verbose = jsobj["verbose"].trueValue();
-
         const NamespaceString nss(parseNs(dbname, jsobj));
 
         if (nss.coll().empty()) {
@@ -934,59 +923,12 @@ public:
             return false;
         }
 
-        AutoGetCollectionForRead ctx(txn, nss);
-        if (!ctx.getDb()) {
-            errmsg = "Database [" + nss.db().toString() + "] not found.";
-            return false;
-        }
-
-        Collection* collection = ctx.getCollection();
-        if (!collection) {
-            errmsg = "Collection [" + nss.toString() + "] not found.";
-            return false;
-        }
-
         result.append("ns", nss.ns());
-
-        long long size = collection->dataSize(txn) / scale;
-        long long numRecords = collection->numRecords(txn);
-        result.appendNumber("count", numRecords);
-        result.appendNumber("size", size);
-        if (numRecords)
-            result.append("avgObjSize", collection->averageObjectSize(txn));
-
-        result.appendNumber("storageSize",
-                            static_cast<long long>(collection->getRecordStore()->storageSize(
-                                txn, &result, verbose ? 1 : 0)) /
-                                scale);
-
-        collection->getRecordStore()->appendCustomStats(txn, &result, scale);
-
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        result.append("nindexes", indexCatalog->numIndexesReady(txn));
-
-        // indexes
-        BSONObjBuilder indexDetails;
-
-        IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(txn, false);
-        while (i.more()) {
-            const IndexDescriptor* descriptor = i.next();
-            IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
-            invariant(iam);
-
-            BSONObjBuilder bob;
-            if (iam->appendCustomStats(txn, &bob, scale)) {
-                indexDetails.append(descriptor->indexName(), bob.obj());
-            }
+        Status status = appendCollectionStorageStats(txn, nss, jsobj, &result);
+        if (!status.isOK()) {
+            errmsg = status.reason();
+            return false;
         }
-
-        result.append("indexDetails", indexDetails.done());
-
-        BSONObjBuilder indexSizes;
-        long long indexSize = collection->getIndexSize(txn, &indexSizes, scale);
-
-        result.appendNumber("totalIndexSize", indexSize / scale);
-        result.append("indexSizes", indexSizes.obj());
 
         return true;
     }
@@ -1006,15 +948,15 @@ public:
     virtual void help(stringstream& help) const {
         help << "Sets collection options.\n"
                 "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
-                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} }";
+                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} "
+                "Example: { collMod: 'foo', index: {name: 'bar', expireAfterSeconds: 600} }\n";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::collMod);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    virtual Status checkAuthForCommand(Client* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj);
     }
 
     bool run(OperationContext* txn,
@@ -1096,6 +1038,7 @@ public:
             // is not needed for the missing DB case, we can just do the same that's done in
             // CollectionStats.
             result.appendNumber("collections", 0);
+            result.appendNumber("views", 0);
             result.appendNumber("objects", 0);
             result.append("avgObjSize", 0);
             result.appendNumber("dataSize", 0);
@@ -1156,7 +1099,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return Status::OK();
@@ -1288,8 +1231,7 @@ void Command::execCommand(OperationContext* txn,
         }
 
         ImpersonationSessionGuard guard(txn);
-        uassertStatusOK(
-            _checkAuthorization(command, txn->getClient(), dbname, request.getCommandArgs()));
+        uassertStatusOK(checkAuthorization(command, txn, dbname, request.getCommandArgs()));
 
         repl::ReplicationCoordinator* replCoord =
             repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
@@ -1370,19 +1312,30 @@ void Command::execCommand(OperationContext* txn,
             oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
 
             auto shardingState = ShardingState::get(txn);
+
+            if (oss.hasShardVersion()) {
+                if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+                    uassertStatusOK(
+                        {ErrorCodes::NoShardingEnabled,
+                         "Cannot accept sharding commands if not started with --shardsvr"});
+                } else if (!shardingState->enabled()) {
+                    // TODO(esha): Once 3.4 ships, we no longer need to support initializing
+                    // sharding awareness through commands, so just reject all sharding commands.
+                    if (!shardingState->commandInitializesShardingAwareness(
+                            request.getCommandName().toString())) {
+                        uassertStatusOK({ErrorCodes::NoShardingEnabled,
+                                         str::stream()
+                                             << "Received a command with sharding chunk version "
+                                                "information but this node is not sharding aware: "
+                                             << request.getCommandArgs().jsonString()});
+                    }
+                }
+            }
+
             if (shardingState->enabled()) {
                 // TODO(spencer): Do this unconditionally once all nodes are sharding aware
                 // by default.
-                shardingState->updateConfigServerOpTimeFromMetadata(txn);
-            } else {
-                massert(
-                    34422,
-                    str::stream()
-                        << "Received a command with sharding chunk version information but this "
-                           "node is not sharding aware: "
-                        << request.getCommandArgs().jsonString(),
-                    !oss.hasShardVersion() ||
-                        ChunkVersion::isIgnoredVersion(oss.getShardVersion(commandNS)));
+                uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(txn));
             }
         }
 
@@ -1441,33 +1394,46 @@ bool Command::run(OperationContext* txn,
     const std::string db = request.getDatabase().toString();
 
     BSONObjBuilder inPlaceReplyBob(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
+    auto readConcernArgsStatus = extractReadConcern(txn, cmd, supportsReadConcern());
 
-    {
-        auto readConcernArgsStatus = extractReadConcern(txn, cmd, supportsReadConcern());
-        if (!readConcernArgsStatus.isOK()) {
-            auto result = appendCommandStatus(inPlaceReplyBob, readConcernArgsStatus.getStatus());
-            inPlaceReplyBob.doneFast();
-            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-            return result;
-        }
+    if (!readConcernArgsStatus.isOK()) {
+        auto result = appendCommandStatus(inPlaceReplyBob, readConcernArgsStatus.getStatus());
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
+    }
 
-        Status rcStatus = waitForReadConcern(txn, readConcernArgsStatus.getValue());
-        if (!rcStatus.isOK()) {
-            if (rcStatus == ErrorCodes::ExceededTimeLimit) {
-                const int debugLevel =
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
-                LOG(debugLevel) << "Command on database " << db
-                                << " timed out waiting for read concern to be satisfied. Command: "
-                                << getRedactedCopyForLogging(request.getCommandArgs());
-            }
-
-            auto result = appendCommandStatus(inPlaceReplyBob, rcStatus);
+    if (readConcernArgsStatus.getValue().getLevel() ==
+        repl::ReadConcernLevel::kLinearizableReadConcern) {
+        auto replCoord = repl::ReplicationCoordinator::get(txn);
+        if (!replCoord->isLinearizableReadConcernEnabled()) {
+            Status status(ErrorCodes::LinearizableReadConcernNotEnabled,
+                          "Linearizable read concern requested, but server was not started with "
+                          "--setParameter enableLinearizableReadConcern=true");
+            inPlaceReplyBob.resetToEmpty();
+            auto result = appendCommandStatus(inPlaceReplyBob, status);
             inPlaceReplyBob.doneFast();
             replyBuilder->setMetadata(rpc::makeEmptyMetadata());
             return result;
         }
     }
 
+
+    Status rcStatus = waitForReadConcern(txn, readConcernArgsStatus.getValue());
+    if (!rcStatus.isOK()) {
+        if (rcStatus == ErrorCodes::ExceededTimeLimit) {
+            const int debugLevel =
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
+            LOG(debugLevel) << "Command on database " << db
+                            << " timed out waiting for read concern to be satisfied. Command: "
+                            << redact(getRedactedCopyForLogging(request.getCommandArgs()));
+        }
+
+        auto result = appendCommandStatus(inPlaceReplyBob, rcStatus);
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
+    }
     auto wcResult = extractWriteConcern(txn, cmd, db, supportsWriteConcern(cmd));
     if (!wcResult.isOK()) {
         auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
@@ -1475,7 +1441,6 @@ bool Command::run(OperationContext* txn,
         replyBuilder->setMetadata(rpc::makeEmptyMetadata());
         return result;
     }
-
     std::string errmsg;
     bool result;
     if (!supportsWriteConcern(cmd)) {
@@ -1490,7 +1455,8 @@ bool Command::run(OperationContext* txn,
         result = run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
 
         // Nothing in run() should change the writeConcern.
-        dassert(txn->getWriteConcern().toBSON() == wcResult.getValue().toBSON());
+        dassert(SimpleBSONObjComparator::kInstance.evaluate(txn->getWriteConcern().toBSON() ==
+                                                            wcResult.getValue().toBSON()));
 
         WriteConcernResult res;
         auto waitForWCStatus =
@@ -1507,6 +1473,23 @@ bool Command::run(OperationContext* txn,
             inPlaceReplyBob.resetToEmpty();
             appendCommandStatus(inPlaceReplyBob, waitForWCStatus);
             inPlaceReplyBob.appendElementsUnique(temp);
+        }
+    }
+
+    // When a linearizable read command is passed in, check to make sure we're reading
+    // from the primary.
+    if (supportsReadConcern() && (readConcernArgsStatus.getValue().getLevel() ==
+                                  repl::ReadConcernLevel::kLinearizableReadConcern) &&
+        (request.getCommandName() != "getMore")) {
+
+        auto linearizableReadStatus = waitForLinearizableReadConcern(txn);
+
+        if (!linearizableReadStatus.isOK()) {
+            inPlaceReplyBob.resetToEmpty();
+            auto result = appendCommandStatus(inPlaceReplyBob, linearizableReadStatus);
+            inPlaceReplyBob.doneFast();
+            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+            return result;
         }
     }
 

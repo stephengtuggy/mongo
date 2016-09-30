@@ -35,6 +35,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -60,7 +61,9 @@ const char kMaxKey[] = "max";
 }  // namespace
 
 ChunkRange::ChunkRange(BSONObj minKey, BSONObj maxKey)
-    : _minKey(std::move(minKey)), _maxKey(std::move(maxKey)) {}
+    : _minKey(std::move(minKey)), _maxKey(std::move(maxKey)) {
+    dassert(SimpleBSONObjComparator::kInstance.evaluate(_minKey < _maxKey));
+}
 
 StatusWith<ChunkRange> ChunkRange::fromBSON(const BSONObj& obj) {
     BSONElement minKey;
@@ -87,6 +90,12 @@ StatusWith<ChunkRange> ChunkRange::fromBSON(const BSONObj& obj) {
         if (maxKey.Obj().isEmpty()) {
             return {ErrorCodes::BadValue, "The max key cannot be empty"};
         }
+    }
+
+    if (SimpleBSONObjComparator::kInstance.evaluate(minKey.Obj() >= maxKey.Obj())) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "min: " << minKey.Obj() << " should be less than max: "
+                              << maxKey.Obj()};
     }
 
     return ChunkRange(minKey.Obj().getOwned(), maxKey.Obj().getOwned());

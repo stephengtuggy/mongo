@@ -38,7 +38,9 @@
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
@@ -57,8 +59,8 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 const char* kNameFieldName = "name";
 const char* kOptionsFieldName = "options";
 
-// The number of retries for the listCollections commands.
-const int numListCollectionsRetries = 1;
+// The number of attempts for the listCollections commands.
+MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListCollectionsAttempts, int, 3);
 
 /**
  * Default listCollections predicate.
@@ -94,7 +96,10 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
       _dbname(dbname),
-      _listCollectionsFilter(listCollectionsFilter),
+      _listCollectionsFilter(
+          listCollectionsFilter.isEmpty()
+              ? ListCollectionsFilter::makeTypeCollectionFilter()
+              : ListCollectionsFilter::addTypeCollectionFilter(listCollectionsFilter)),
       _listCollectionsPredicate(listCollectionsPred ? listCollectionsPred : acceptAllPred),
       _storageInterface(si),
       _collectionWork(collWork),
@@ -111,13 +116,10 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
                               rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
                               RemoteCommandRequest::kNoTimeout,
                               RemoteCommandRetryScheduler::makeRetryPolicy(
-                                  numListCollectionsRetries,
+                                  numInitialSyncListCollectionsAttempts,
                                   executor::RemoteCommandRequest::kNoTimeout,
                                   RemoteCommandRetryScheduler::kAllRetriableErrors)),
-      _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackFn& work) {
-          return _executor->scheduleWork(work);
-      }),
-      _startCollectionCloner([](CollectionCloner& cloner) { return cloner.start(); }) {
+      _startCollectionCloner([](CollectionCloner& cloner) { return cloner.startup(); }) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
     uassert(ErrorCodes::BadValue, "db worker thread pool cannot be null", dbWorkThreadPool);
@@ -125,13 +127,15 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
     uassert(ErrorCodes::BadValue, "storage interface cannot be null", si);
     uassert(ErrorCodes::BadValue, "collection callback function cannot be null", collWork);
     uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
+
+    _stats.dbname = _dbname;
 }
 
 DatabaseCloner::~DatabaseCloner() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
 }
 
-const std::vector<BSONObj>& DatabaseCloner::getCollectionInfos() const {
+const std::vector<BSONObj>& DatabaseCloner::getCollectionInfos_forTest() const {
     LockGuard lk(_mutex);
     return _collectionInfos;
 }
@@ -159,7 +163,7 @@ bool DatabaseCloner::isActive() const {
     return _active;
 }
 
-Status DatabaseCloner::start() {
+Status DatabaseCloner::startup() {
     LockGuard lk(_mutex);
 
     if (_active) {
@@ -180,7 +184,7 @@ Status DatabaseCloner::start() {
     return Status::OK();
 }
 
-void DatabaseCloner::cancel() {
+void DatabaseCloner::shutdown() {
     {
         LockGuard lk(_mutex);
 
@@ -189,20 +193,24 @@ void DatabaseCloner::cancel() {
         }
     }
 
-    _listCollectionsFetcher.cancel();
+    _listCollectionsFetcher.shutdown();
 }
 
 DatabaseCloner::Stats DatabaseCloner::getStats() const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stats;
+    LockGuard lk(_mutex);
+    DatabaseCloner::Stats stats = _stats;
+    for (auto&& collectionCloner : _collectionCloners) {
+        stats.collectionStats.emplace_back(collectionCloner.getStats());
+    }
+    return stats;
 }
 
-void DatabaseCloner::wait() {
+void DatabaseCloner::join() {
     UniqueLock lk(_mutex);
     _condition.wait(lk, [this]() { return !_active; });
 }
 
-void DatabaseCloner::setScheduleDbWorkFn(const CollectionCloner::ScheduleDbWorkFn& work) {
+void DatabaseCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
     LockGuard lk(_mutex);
 
     _scheduleDbWorkFn = work;
@@ -233,11 +241,11 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
     UniqueLock lk(_mutex);
     // We may be called with multiple batches leading to a need to grow _collectionInfos.
     _collectionInfos.reserve(_collectionInfos.size() + documents.size());
-    _stats.collections += documents.size();
     std::copy_if(documents.begin(),
                  documents.end(),
                  std::back_inserter(_collectionInfos),
                  _listCollectionsPredicate);
+    _stats.collections += _collectionInfos.size();
 
     // The fetcher will continue to call with kGetMore until an error or the last batch.
     if (*nextAction == Fetcher::NextAction::kGetMore) {
@@ -332,8 +340,10 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         }
     }
 
-    for (auto&& collectionCloner : _collectionCloners) {
-        collectionCloner.setScheduleDbWorkFn(_scheduleDbWorkFn);
+    if (_scheduleDbWorkFn) {
+        for (auto&& collectionCloner : _collectionCloners) {
+            collectionCloner.setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+        }
     }
 
     // Start first collection cloner.
@@ -344,7 +354,7 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
     Status startStatus = _startCollectionCloner(*_currentCollectionClonerIter);
     if (!startStatus.isOK()) {
         LOG(1) << "    failed to start collection cloning on "
-               << _currentCollectionClonerIter->getSourceNamespace() << ": " << startStatus;
+               << _currentCollectionClonerIter->getSourceNamespace() << ": " << redact(startStatus);
         _finishCallback_inlock(lk, startStatus);
         return;
     }
@@ -376,7 +386,8 @@ void DatabaseCloner::_collectionClonerCallback(const Status& status, const Names
         Status startStatus = _startCollectionCloner(*_currentCollectionClonerIter);
         if (!startStatus.isOK()) {
             LOG(1) << "    failed to start collection cloning on "
-                   << _currentCollectionClonerIter->getSourceNamespace() << ": " << startStatus;
+                   << _currentCollectionClonerIter->getSourceNamespace() << ": "
+                   << redact(startStatus);
             _finishCallback_inlock(lk, startStatus);
             return;
         }
@@ -411,6 +422,9 @@ void DatabaseCloner::_finishCallback_inlock(UniqueLock& lk, const Status& status
     _finishCallback(status);
 }
 
+std::string DatabaseCloner::getDBName() const {
+    return _dbname;
+}
 
 std::string DatabaseCloner::Stats::toString() const {
     return toBSON().toString();
@@ -418,14 +432,29 @@ std::string DatabaseCloner::Stats::toString() const {
 
 BSONObj DatabaseCloner::Stats::toBSON() const {
     BSONObjBuilder bob;
-    bob.appendNumber("collections", collections);
-    bob.appendNumber("clonedCollections", clonedCollections);
-    bob.appendDate("start", start);
-    bob.appendDate("end", end);
-    auto elapsed = end - start;
-    long long elapsedMillis = duration_cast<Milliseconds>(elapsed).count();
-    bob.appendNumber("elapsedMillis", elapsedMillis);
+    bob.append("dbname", dbname);
+    append(&bob);
     return bob.obj();
+}
+
+void DatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("collections", collections);
+    builder->appendNumber("clonedCollections", clonedCollections);
+    if (start != Date_t()) {
+        builder->appendDate("start", start);
+        if (end != Date_t()) {
+            builder->appendDate("end", end);
+            auto elapsed = end - start;
+            long long elapsedMillis = duration_cast<Milliseconds>(elapsed).count();
+            builder->appendNumber("elapsedMillis", elapsedMillis);
+        }
+    }
+
+    for (auto&& collection : collectionStats) {
+        BSONObjBuilder collectionBuilder(builder->subobjStart(collection.ns));
+        collection.append(&collectionBuilder);
+        collectionBuilder.doneFast();
+    }
 }
 
 }  // namespace repl

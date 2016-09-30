@@ -63,7 +63,11 @@ MultiApplier::MultiApplier(executor::TaskExecutor* executor,
 }
 
 MultiApplier::~MultiApplier() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
+}
+
+std::string MultiApplier::toString() const {
+    return getDiagnosticString();
 }
 
 std::string MultiApplier::getDiagnosticString() const {
@@ -82,7 +86,7 @@ bool MultiApplier::isActive() const {
     return _active;
 }
 
-Status MultiApplier::start() {
+Status MultiApplier::startup() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     if (_active) {
@@ -101,7 +105,7 @@ Status MultiApplier::start() {
     return Status::OK();
 }
 
-void MultiApplier::cancel() {
+void MultiApplier::shutdown() {
     executor::TaskExecutor::CallbackHandle dbWorkCallbackHandle;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -118,7 +122,7 @@ void MultiApplier::cancel() {
     }
 }
 
-void MultiApplier::wait() {
+void MultiApplier::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     while (_active) {
@@ -128,7 +132,7 @@ void MultiApplier::wait() {
 
 void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     if (!cbd.status.isOK()) {
-        _finishCallback(cbd.status, _operations);
+        _finishCallback(cbd.status);
         return;
     }
 
@@ -137,97 +141,19 @@ void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     StatusWith<OpTime> applyStatus(ErrorCodes::InternalError, "not mutated");
     try {
         auto txn = cc().makeOperationContext();
-
-        // Refer to multiSyncApply() and multiInitialSyncApply() in sync_tail.cpp.
-        txn->setReplicatedWrites(false);
-
-        // allow us to get through the magic barrier
-        txn->lockState()->setIsBatchWriter(true);
-
         applyStatus = _multiApply(txn.get(), _operations, _applyOperation);
     } catch (...) {
         applyStatus = exceptionToStatus();
     }
-    if (!applyStatus.isOK()) {
-        _finishCallback(applyStatus.getStatus(), _operations);
-        return;
-    }
-    _finishCallback(applyStatus.getValue().getTimestamp(), _operations);
+    _finishCallback(applyStatus.getStatus());
 }
 
-void MultiApplier::_finishCallback(const StatusWith<Timestamp>& result,
-                                   const Operations& operations) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+void MultiApplier::_finishCallback(const Status& result) {
+    _onCompletion(result);
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _active = false;
     _condition.notify_all();
-    auto finish = _onCompletion;
-    lk.unlock();
-
-    // This instance may be destroyed during the "finish" call.
-    finish(result, operations);
-}
-
-namespace {
-
-void pauseBeforeCompletion(const StatusWith<Timestamp>& result,
-                           const MultiApplier::Operations& operationsOnCompletion,
-                           const PauseDataReplicatorFn& pauseDataReplicator,
-                           const MultiApplier::CallbackFn& onCompletion) {
-    if (result.isOK()) {
-        pauseDataReplicator();
-    }
-    onCompletion(result, operationsOnCompletion);
-};
-
-}  // namespace
-
-StatusWith<std::pair<std::unique_ptr<MultiApplier>, MultiApplier::Operations>> applyUntilAndPause(
-    executor::TaskExecutor* executor,
-    const MultiApplier::Operations& operations,
-    const MultiApplier::ApplyOperationFn& applyOperation,
-    const MultiApplier::MultiApplyFn& multiApply,
-    const Timestamp& lastTimestampToApply,
-    const PauseDataReplicatorFn& pauseDataReplicator,
-    const MultiApplier::CallbackFn& onCompletion) {
-    try {
-        auto comp = [](const OplogEntry& left, const OplogEntry& right) {
-            uassert(ErrorCodes::FailedToParse,
-                    str::stream() << "Operation missing 'ts' field': " << left.raw,
-                    left.raw.hasField("ts"));
-            uassert(ErrorCodes::FailedToParse,
-                    str::stream() << "Operation missing 'ts' field': " << right.raw,
-                    right.raw.hasField("ts"));
-            return left.raw["ts"].timestamp() < right.raw["ts"].timestamp();
-        };
-        auto wrapped = OplogEntry(BSON("ts" << lastTimestampToApply));
-        auto i = std::lower_bound(operations.cbegin(), operations.cend(), wrapped, comp);
-        bool found = i != operations.cend() && !comp(wrapped, *i);
-        auto j = found ? i + 1 : i;
-        MultiApplier::Operations operationsInRange(operations.cbegin(), j);
-        MultiApplier::Operations operationsNotInRange(j, operations.cend());
-        if (!found) {
-            return std::make_pair(
-                std::unique_ptr<MultiApplier>(new MultiApplier(
-                    executor, operationsInRange, applyOperation, multiApply, onCompletion)),
-                operationsNotInRange);
-        }
-
-        return std::make_pair(
-            std::unique_ptr<MultiApplier>(new MultiApplier(executor,
-                                                           operationsInRange,
-                                                           applyOperation,
-                                                           multiApply,
-                                                           stdx::bind(pauseBeforeCompletion,
-                                                                      stdx::placeholders::_1,
-                                                                      stdx::placeholders::_2,
-                                                                      pauseDataReplicator,
-                                                                      onCompletion))),
-            operationsNotInRange);
-    } catch (...) {
-        return exceptionToStatus();
-    }
-    MONGO_UNREACHABLE;
-    return Status(ErrorCodes::InternalError, "unreachable");
 }
 
 }  // namespace repl

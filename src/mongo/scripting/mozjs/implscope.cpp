@@ -67,11 +67,10 @@ const char* const MozJSImplScope::kInvokeResult = "__returnValue";
 namespace {
 
 /**
- * The maximum amount of memory to be given out per thread to mozilla. We
- * manage this by trapping all calls to malloc, free, etc. and keeping track of
- * counts in some thread locals
+ * The threshold (as a fraction of the max) after which garbage collection will be run during
+ * interrupts.
  */
-const size_t kMallocMemoryLimit = 1024ul * 1024 * 1024 * 1.1;
+const double kInterruptGCThreshold = 0.8;
 
 /**
  * The number of bytes to allocate after which garbage collection is run
@@ -91,44 +90,65 @@ const int kStackChunkSize = 8192;
 stdx::mutex gRuntimeCreationMutex;
 bool gFirstRuntimeCreated = false;
 
+bool closeToMaxMemory() {
+    return mongo::sm::get_total_bytes() > (kInterruptGCThreshold * mongo::sm::get_max_bytes());
+}
 }  // namespace
 
 MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL MozJSImplScope* kCurrentScope;
 
 struct MozJSImplScope::MozJSEntry {
-    MozJSEntry(MozJSImplScope* scope) : ar(scope->_context), ac(scope->_context, scope->_global) {}
+    MozJSEntry(MozJSImplScope* scope)
+        : ar(scope->_context), ac(scope->_context, scope->_global), _scope(scope) {
+        ++_scope->_inOp;
+    }
+
+    ~MozJSEntry() {
+        --_scope->_inOp;
+    }
 
     JSAutoRequest ar;
     JSAutoCompartment ac;
+    MozJSImplScope* _scope;
 };
 
 void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorReport* report) {
     auto scope = getScope(cx);
 
     if (!JSREPORT_IS_WARNING(report->flags)) {
-        str::stream ss;
-        ss << message;
 
-        // TODO: something far more elaborate that mimics the stack printing from v8
-        JS::RootedValue excn(cx);
-        if (JS_GetPendingException(cx, &excn) && excn.isObject()) {
-            JS::RootedValue stack(cx);
+        std::string exceptionMsg;
 
-            ObjectWrapper(cx, excn).getValue("stack", &stack);
+        try {
+            str::stream ss;
+            ss << message;
 
-            auto str = ValueWriter(cx, stack).toString();
+            // TODO: something far more elaborate that mimics the stack printing from v8
+            JS::RootedValue excn(cx);
+            if (JS_GetPendingException(cx, &excn) && excn.isObject()) {
+                JS::RootedValue stack(cx);
 
-            if (str.empty()) {
-                ss << " @" << report->filename << ":" << report->lineno << ":" << report->column
-                   << "\n";
-            } else {
-                ss << " :\n" << str;
+                ObjectWrapper(cx, excn).getValue("stack", &stack);
+
+                auto str = ValueWriter(cx, stack).toString();
+
+                if (str.empty()) {
+                    ss << " @" << report->filename << ":" << report->lineno << ":" << report->column
+                       << "\n";
+                } else {
+                    ss << " :\n" << str;
+                }
             }
+
+            exceptionMsg = ss;
+        } catch (const DBException& dbe) {
+            exceptionMsg = "Unknown error occured while processing exception";
+            log() << exceptionMsg << ":" << dbe.toString() << ":" << message;
         }
 
         scope->_status = Status(
             JSErrorReportToStatus(cx, report, ErrorCodes::JSInterpreterFailure, message).code(),
-            ss);
+            exceptionMsg);
     }
 }
 
@@ -137,28 +157,32 @@ std::string MozJSImplScope::getError() {
 }
 
 void MozJSImplScope::registerOperation(OperationContext* txn) {
-    invariant(_opId == 0);
+    invariant(_opCtx == nullptr);
 
     // getPooledScope may call registerOperation with a nullptr, so we have to
     // check for that here.
     if (!txn)
         return;
 
+    _opCtx = txn;
     _opId = txn->getOpID();
 
     _engine->registerOperation(txn, this);
 }
 
 void MozJSImplScope::unregisterOperation() {
-    if (_opId != 0) {
+    if (_opCtx) {
         _engine->unregisterOperation(_opId);
-
-        _opId = 0;
+        _opCtx = nullptr;
     }
 }
 
 void MozJSImplScope::kill() {
     _pendingKill.store(true);
+    JS_RequestInterruptCallback(_runtime);
+}
+
+void MozJSImplScope::interrupt() {
     JS_RequestInterruptCallback(_runtime);
 }
 
@@ -180,7 +204,7 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     JS_SetInterruptCallback(scope->_runtime, nullptr);
     auto guard = MakeGuard([&]() { JS_SetInterruptCallback(scope->_runtime, _interruptCallback); });
 
-    if (scope->_pendingGC.load()) {
+    if (scope->_pendingGC.load() || closeToMaxMemory()) {
         scope->_pendingGC.store(false);
         JS_GC(scope->_runtime);
     } else {
@@ -191,6 +215,14 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
         scope->_status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
     } else if (scope->isKillPending()) {
         scope->_status = Status(ErrorCodes::Interrupted, "Interrupted by the host");
+    }
+    // If we are on the right thread, in the middle of an operation, and we have a registered opCtx,
+    // then we should check the opCtx for interrupts.
+    if ((scope->_mr._thread == PR_GetCurrentThread()) && (scope->_inOp > 0) && scope->_opCtx) {
+        auto status = scope->_opCtx->checkForInterruptNoAssert();
+        if (!status.isOK()) {
+            scope->_status = status;
+        }
     }
 
     if (!scope->_status.isOK()) {
@@ -208,12 +240,17 @@ void MozJSImplScope::_gcCallback(JSRuntime* rt, JSGCStatus status, void* data) {
     }
 
     log() << "MozJS GC " << (status == JSGC_BEGIN ? "prologue" : "epilogue") << " heap stats - "
-          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes()
-          << std::endl;
+          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes();
 }
 
 MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
-    mongo::sm::reset(kMallocMemoryLimit);
+    /**
+     * The maximum amount of memory to be given out per thread to mozilla. We
+     * manage this by trapping all calls to malloc, free, etc. and keeping track of
+     * counts in some thread locals
+     */
+    size_t mallocMemoryLimit = 1024ul * 1024 * engine->getJSHeapLimitMB();
+    mongo::sm::reset(mallocMemoryLimit);
 
     // If this runtime isn't running on an NSPR thread, then it is
     // running on a mongo thread. In that case, we need to insert a
@@ -280,7 +317,7 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
         }
 
         // The memory limit is in megabytes
-        JS_SetGCParametersBasedOnAvailableMemory(_runtime, kMallocMemoryLimit / (1024 * 1024));
+        JS_SetGCParametersBasedOnAvailableMemory(_runtime, engine->getJSHeapLimitMB());
     }
 
     _context = JS_NewContext(_runtime, kStackChunkSize);
@@ -310,6 +347,7 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _pendingKill(false),
       _opId(0),
       _opCtx(nullptr),
+      _inOp(0),
       _pendingGC(false),
       _connectState(ConnectState::Not),
       _status(Status::OK()),
@@ -320,12 +358,12 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _bsonProto(_context),
       _codeProto(_context),
       _countDownLatchProto(_context),
-      _cursorProto(_context),
       _cursorHandleProto(_context),
+      _cursorProto(_context),
       _dbCollectionProto(_context),
+      _dbProto(_context),
       _dbPointerProto(_context),
       _dbQueryProto(_context),
-      _dbProto(_context),
       _dbRefProto(_context),
       _errorProto(_context),
       _jsThreadProto(_context),
@@ -335,13 +373,14 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _mongoHelpersProto(_context),
       _mongoLocalProto(_context),
       _nativeFunctionProto(_context),
+      _numberDecimalProto(_context),
       _numberIntProto(_context),
       _numberLongProto(_context),
-      _numberDecimalProto(_context),
       _objectProto(_context),
       _oidProto(_context),
       _regExpProto(_context),
-      _timestampProto(_context) {
+      _timestampProto(_context),
+      _uriProto(_context) {
     kCurrentScope = this;
 
     // The default is quite low and doesn't seem to directly correlate with
@@ -609,14 +648,16 @@ int MozJSImplScope::invoke(ScriptingFunction func,
 
     if (timeoutMs)
         _engine->getDeadlineMonitor().startDeadline(this, timeoutMs);
+    else {
+        _engine->getDeadlineMonitor().startDeadline(this, -1);
+    }
 
     JS::RootedValue out(_context);
     JS::RootedObject obj(_context, smrecv.toObjectOrNull());
 
     bool success = JS::Call(_context, obj, funcValue, args, &out);
 
-    if (timeoutMs)
-        _engine->getDeadlineMonitor().stopDeadline(this);
+    _engine->getDeadlineMonitor().stopDeadline(this);
 
     _checkErrorState(success);
 
@@ -646,7 +687,7 @@ bool MozJSImplScope::exec(StringData code,
 
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
-    co.setFile(name.c_str());
+    co.setFileAndLine(name.c_str(), 1);
     JS::RootedScript script(_context);
 
     bool success = JS::Compile(_context, co, code.rawData(), code.size(), &script);
@@ -654,15 +695,17 @@ bool MozJSImplScope::exec(StringData code,
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
 
-    if (timeoutMs)
+    if (timeoutMs) {
         _engine->getDeadlineMonitor().startDeadline(this, timeoutMs);
+    } else {
+        _engine->getDeadlineMonitor().startDeadline(this, -1);
+    }
 
     JS::RootedValue out(_context);
 
     success = JS_ExecuteScript(_context, script, &out);
 
-    if (timeoutMs)
-        _engine->getDeadlineMonitor().stopDeadline(this);
+    _engine->getDeadlineMonitor().stopDeadline(this);
 
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
@@ -696,9 +739,6 @@ void MozJSImplScope::gc() {
 
 void MozJSImplScope::localConnectForDbEval(OperationContext* txn, const char* dbName) {
     MozJSEntry entry(this);
-
-    invariant(_opCtx == NULL);
-    _opCtx = txn;
 
     if (_connectState == ConnectState::External)
         uasserted(12510, "externalSetup already called, can't call localConnect");
@@ -739,8 +779,6 @@ void MozJSImplScope::externalSetup() {
     if (_connectState == ConnectState::Local)
         uasserted(12512, "localConnect already called, can't call externalSetup");
 
-    mongo::sm::reset(0);
-
     // install db access functions in the global object
     installDBAccess();
 
@@ -777,6 +815,7 @@ void MozJSImplScope::installBSONTypes() {
     _oidProto.install(_global);
     _regExpProto.install(_global);
     _timestampProto.install(_global);
+    _uriProto.install(_global);
 
     // This builtin map is a javascript 6 thing.  We want our version.  so
     // take theirs out
@@ -808,12 +847,18 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
         if (JS_GetPendingException(_context, &excn) && excn.isObject()) {
             str::stream ss;
 
-            JS::RootedValue stack(_context);
+            auto stackStr = ObjectWrapper(_context, excn).getString(InternedString::stack);
+            auto fnameStr = ObjectWrapper(_context, excn).getString(InternedString::fileName);
+            auto lineNum = ObjectWrapper(_context, excn).getNumberInt(InternedString::lineNumber);
+            auto colNum = ObjectWrapper(_context, excn).getNumberInt(InternedString::columnNumber);
 
-            ObjectWrapper(_context, excn).getValue("stack", &stack);
-
-            ss << ValueWriter(_context, excn).toString() << " :\n"
-               << ValueWriter(_context, stack).toString();
+            if (fnameStr != "") {
+                ss << "[" << fnameStr << ":" << lineNum << ":" << colNum << "] ";
+            }
+            ss << ValueWriter(_context, excn).toString();
+            if (stackStr != "") {
+                ss << "\nStack trace:\n" << stackStr << "----------\n";
+            }
             _status = Status(ErrorCodes::JSInterpreterFailure, ss);
         } else {
             _status = Status(ErrorCodes::UnknownError, "Unknown Failure from JSInterpreter");
@@ -823,7 +868,7 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
     _error = _status.reason();
 
     if (reportError)
-        error() << _error << std::endl;
+        error() << redact(_error);
 
     // Clear the status state
     auto status = std::move(_status);

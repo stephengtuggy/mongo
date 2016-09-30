@@ -47,6 +47,7 @@ class AbstractMessagingPort;
 class Client;
 class OperationContext;
 class OpObserver;
+class ServiceEntryPoint;
 
 namespace transport {
 class Session;
@@ -285,10 +286,11 @@ public:
     }
 
     /**
-     * @param i opid of operation to kill
-     * @return if operation was found
+     * Kills the operation "txn" with the code "killCode", if txn has not already been killed.
+     * Caller must own the lock on txn->getClient, and txn->getServiceContext() must be the same as
+     * this service context.
      **/
-    bool killOperation(unsigned int opId);
+    void killOperation(OperationContext* txn, ErrorCodes::Error killCode = ErrorCodes::Interrupted);
 
     /**
      * Kills all operations that have a Client that is associated with an incoming user
@@ -315,6 +317,13 @@ public:
      * See TransportLayerManager for more details.
      */
     transport::TransportLayer* getTransportLayer() const;
+
+    /**
+     * Get the service entry point for the service context.
+     *
+     * See ServiceEntryPoint for more details.
+     */
+    ServiceEntryPoint* getServiceEntryPoint() const;
 
     /**
      * Add a new TransportLayer to this service context. The new TransportLayer will
@@ -372,6 +381,11 @@ public:
      */
     void setPreciseClockSource(std::unique_ptr<ClockSource> newSource);
 
+    /**
+     * Binds the service entry point implementation to the service context
+     */
+    void setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep);
+
 protected:
     ServiceContext();
 
@@ -399,6 +413,11 @@ private:
      * The TransportLayerManager.
      */
     std::unique_ptr<transport::TransportLayerManager> _transportLayerManager;
+
+    /**
+     * The service entry point
+     */
+    std::unique_ptr<ServiceEntryPoint> _serviceEntryPoint;
 
     /**
      * Vector of registered observers.

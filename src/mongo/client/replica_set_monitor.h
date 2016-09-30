@@ -80,11 +80,11 @@ public:
      *   wait for one to become available for up to the specified time and periodically refresh
      *   the view of the set. The call may return with an error earlier than the specified value,
      *   if none of the known hosts for the set are reachable within some number of attempts.
+     *   Note that if a maxWait of 0ms is specified, this method may still attempt to contact
+     *   every host in the replica set up to one time.
      *
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
-     *  ReplicaSetNotFound, if none of the known hosts for the replica set are reachable within
-     *      maxConsecutiveFailedChecks number of attempts.
      */
     StatusWith<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
                                              Milliseconds maxWait = kDefaultFindHostTimeout);
@@ -136,13 +136,6 @@ public:
     int getMaxWireVersion() const;
 
     /**
-     * This call will return false if this monitor ever enters a state where none of the nodes could
-     * be contacted for some amount of attempts. Such monitors will be removed from the periodic
-     * refresh thread.
-     */
-    bool isSetUsable() const;
-
-    /**
      * The name of the set.
      */
     std::string getName() const;
@@ -171,7 +164,8 @@ public:
     /**
      * Creates a new ReplicaSetMonitor, if it doesn't already exist.
      */
-    static void createIfNeeded(const std::string& name, const std::set<HostAndPort>& servers);
+    static std::shared_ptr<ReplicaSetMonitor> createIfNeeded(const std::string& name,
+                                                             const std::set<HostAndPort>& servers);
 
     /**
      * gets a cached Monitor per name. If the monitor is not found and createFromSeed is false,
@@ -213,9 +207,14 @@ public:
     /**
      * Permanently stops all monitoring on replica sets and clears all cached information
      * as well. As a consequence, NEVER call this if you have other threads that have a
-     * DBClientReplicaSet instance.
+     * DBClientReplicaSet instance. This method should be used for unit test only.
      */
     static void cleanup();
+
+    /**
+     * Permanently stops all monitoring on replica sets.
+     */
+    static void shutdown();
 
     //
     // internal types (defined in replica_set_monitor_internal.h)
@@ -232,13 +231,6 @@ public:
      */
     explicit ReplicaSetMonitor(const SetStatePtr& initialState) : _state(initialState) {}
     ~ReplicaSetMonitor();
-
-    /**
-     * If a ReplicaSetMonitor has been refreshed more than this many times in a row without
-     * finding any live nodes claiming to be in the set, the ReplicaSetMonitor will stop
-     * periodic background refreshes of this set.
-     */
-    static std::atomic<int> maxConsecutiveFailedChecks;  // NOLINT
 
     /**
      * The default timeout, which will be used for finding a replica set host if the caller does

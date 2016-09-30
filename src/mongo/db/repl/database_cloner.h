@@ -62,13 +62,16 @@ class DatabaseCloner : public BaseCloner {
 
 public:
     struct Stats {
+        std::string dbname;
         Date_t start;
         Date_t end;
         size_t collections{0};
         size_t clonedCollections{0};
+        std::vector<CollectionCloner::Stats> collectionStats;
 
         std::string toString() const;
         BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
     };
 
     /**
@@ -106,6 +109,8 @@ public:
      * 'onCompletion' will be called exactly once.
      *
      * Takes ownership of the passed StorageInterface object.
+     *
+     * 'listCollectionsFilter' will be extended to include collections only, filtering out views.
      */
     DatabaseCloner(executor::TaskExecutor* executor,
                    OldThreadPool* dbWorkThreadPool,
@@ -120,23 +125,23 @@ public:
     virtual ~DatabaseCloner();
 
     /**
-     * Returns collection info objects read from listCollections result.
-     * This will return an empty vector until we have processed the last
-     * batch of results from listCollections.
+     * Returns collection info objects read from listCollections result and will not include views.
      */
-    const std::vector<BSONObj>& getCollectionInfos() const;
+    const std::vector<BSONObj>& getCollectionInfos_forTest() const;
 
     std::string getDiagnosticString() const override;
 
     bool isActive() const override;
 
-    Status start() override;
+    Status startup() override;
 
-    void cancel() override;
+    void shutdown() override;
 
-    void wait() override;
+    void join() override;
 
     DatabaseCloner::Stats getStats() const;
+
+    std::string getDBName() const;
 
     //
     // Testing only functions below.
@@ -147,7 +152,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
 
     /**
      * Overrides how executor starts a collection cloner.

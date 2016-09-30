@@ -32,16 +32,17 @@
 
 #include "mongo/s/chunk.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/platform/random.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharding_raii.h"
@@ -80,7 +81,7 @@ Chunk::Chunk(OperationContext* txn, ChunkManager* manager, const ChunkType& from
     uassert(13327, "Chunk ns must match server ns", ns == _manager->getns());
     uassert(10172, "Chunk needs a min", !_min.isEmpty());
     uassert(10173, "Chunk needs a max", !_max.isEmpty());
-    uassert(10171, "Chunk needs a server", grid.shardRegistry()->getShard(txn, _shardId));
+    uassert(10171, "Chunk needs a server", grid.shardRegistry()->getShard(txn, _shardId).isOK());
 }
 
 Chunk::Chunk(ChunkManager* info,
@@ -264,7 +265,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
 
     // Normally, we'd have a sound split point here if the chunk is not empty.
     // It's also a good place to sanity check.
-    if (_min == splitPoints.front()) {
+    if (SimpleBSONObjComparator::kInstance.evaluate(_min == splitPoints.front())) {
         string msg(str::stream() << "not splitting chunk " << toString() << ", split point "
                                  << splitPoints.front()
                                  << " is exactly on chunk bounds");
@@ -272,7 +273,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
         return Status(ErrorCodes::CannotSplit, msg);
     }
 
-    if (_max == splitPoints.back()) {
+    if (SimpleBSONObjComparator::kInstance.evaluate(_max == splitPoints.back())) {
         string msg(str::stream() << "not splitting chunk " << toString() << ", split point "
                                  << splitPoints.back()
                                  << " is exactly on chunk bounds");
@@ -287,6 +288,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
                                                              _manager->getVersion(),
                                                              _min,
                                                              _max,
+                                                             getLastmod(),
                                                              splitPoints);
     if (!splitStatus.isOK()) {
         return splitStatus.getStatus();
@@ -382,8 +384,8 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
             // We need to use the latest chunk manager (after the split) in order to have the most
             // up-to-date view of the chunk we are about to move
             auto scopedCM = uassertStatusOK(ScopedChunkManager::getExisting(txn, nss));
-            auto suggestedChunk =
-                scopedCM.cm()->findIntersectingChunk(txn, suggestedMigrateChunk->getMin());
+            auto suggestedChunk = scopedCM.cm()->findIntersectingChunkWithSimpleCollation(
+                txn, suggestedMigrateChunk->getMin());
 
             ChunkType chunkToMove;
             chunkToMove.setNS(nss.ns());
@@ -392,7 +394,7 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
             chunkToMove.setMax(suggestedChunk->getMax());
             chunkToMove.setVersion(suggestedChunk->getLastmod());
 
-            Status rebalanceStatus = Balancer::get(txn)->rebalanceSingleChunk(txn, chunkToMove);
+            Status rebalanceStatus = configsvr_client::rebalanceChunk(txn, chunkToMove);
             if (!rebalanceStatus.isOK()) {
                 msgassertedNoTraceWithStatus(10412, rebalanceStatus);
             }
@@ -413,7 +415,7 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
 }
 
 ConnectionString Chunk::_getShardConnectionString(OperationContext* txn) const {
-    const auto shard = grid.shardRegistry()->getShard(txn, getShardId());
+    const auto shard = uassertStatusOK(grid.shardRegistry()->getShard(txn, getShardId()));
     return shard->getConnString();
 }
 

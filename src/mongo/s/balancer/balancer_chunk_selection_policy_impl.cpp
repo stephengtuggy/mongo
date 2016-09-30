@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -49,7 +50,7 @@
 
 namespace mongo {
 
-using ChunkMinimumsSet = std::set<BSONObj>;
+using ChunkMinimumsSet = BSONObjSet;
 using MigrateInfoVector = BalancerChunkSelectionPolicy::MigrateInfoVector;
 using SplitInfoVector = BalancerChunkSelectionPolicy::SplitInfoVector;
 using std::shared_ptr;
@@ -65,7 +66,7 @@ namespace {
 StatusWith<std::pair<DistributionStatus, ChunkMinimumsSet>> createCollectionDistributionInfo(
     OperationContext* txn, const ShardStatisticsVector& allShards, ChunkManager* chunkMgr) {
     ShardToChunksMap shardToChunksMap;
-    ChunkMinimumsSet chunkMinimums;
+    ChunkMinimumsSet chunkMinimums = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
 
     // Makes sure there is an entry in shardToChunksMap for every shard, so empty shards will also
     // be accounted for
@@ -103,13 +104,13 @@ StatusWith<std::pair<DistributionStatus, ChunkMinimumsSet>> createCollectionDist
     const auto& keyPattern = chunkMgr->getShardKeyPattern().getKeyPattern();
 
     for (const auto& tag : collectionTags) {
-        if (!distribution.addTagRange(TagRange(keyPattern.extendRangeBound(tag.getMinKey(), false),
-                                               keyPattern.extendRangeBound(tag.getMaxKey(), false),
-                                               tag.getTag()))) {
-            return {ErrorCodes::BadValue,
-                    str::stream() << "Tag ranges are not valid for collection " << chunkMgr->getns()
-                                  << ". Balancing for this collection will be skipped until "
-                                     "the ranges are fixed."};
+        auto status = distribution.addRangeToZone(
+            ZoneRange(keyPattern.extendRangeBound(tag.getMinKey(), false),
+                      keyPattern.extendRangeBound(tag.getMaxKey(), false),
+                      tag.getTag()));
+
+        if (!status.isOK()) {
+            return status;
         }
     }
 
@@ -118,9 +119,8 @@ StatusWith<std::pair<DistributionStatus, ChunkMinimumsSet>> createCollectionDist
 
 }  // namespace
 
-BalancerChunkSelectionPolicyImpl::BalancerChunkSelectionPolicyImpl(
-    std::unique_ptr<ClusterStatistics> clusterStats)
-    : _clusterStats(std::move(clusterStats)) {}
+BalancerChunkSelectionPolicyImpl::BalancerChunkSelectionPolicyImpl(ClusterStatistics* clusterStats)
+    : _clusterStats(clusterStats) {}
 
 BalancerChunkSelectionPolicyImpl::~BalancerChunkSelectionPolicyImpl() = default;
 
@@ -151,7 +151,10 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
         const NamespaceString nss(coll.getNs());
 
         auto candidatesStatus = _getSplitCandidatesForCollection(txn, nss, shardStats);
-        if (!candidatesStatus.isOK()) {
+        if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
+            // Namespace got dropped before we managed to get to it, so just skip it
+            continue;
+        } else if (!candidatesStatus.isOK()) {
             warning() << "Unable to enforce tag range policy for collection " << nss.ns()
                       << causedBy(candidatesStatus.getStatus());
             continue;
@@ -202,7 +205,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
 
         auto candidatesStatus =
             _getMigrateCandidatesForCollection(txn, nss, shardStats, aggressiveBalanceHint);
-        if (!candidatesStatus.isOK()) {
+        if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
+            // Namespace got dropped before we managed to get to it, so just skip it
+            continue;
+        } else if (!candidatesStatus.isOK()) {
             warning() << "Unable to balance collection " << nss.ns()
                       << causedBy(candidatesStatus.getStatus());
             continue;
@@ -324,7 +330,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
             continue;
         }
 
-        shared_ptr<Chunk> chunk = cm->findIntersectingChunk(txn, tagRange.min);
+        shared_ptr<Chunk> chunk = cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.min);
 
         if (!currentChunk) {
             currentChunk = chunk;

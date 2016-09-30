@@ -53,14 +53,14 @@ struct MongoProgramScope {
     MongoProgramScope() {}  // Avoid 'unused variable' warning.
     ~MongoProgramScope();
 };
-void KillMongoProgramInstances();
+int KillMongoProgramInstances();
 
 void installShellUtilsLauncher(Scope& scope);
 
 /** Record log lines from concurrent programs.  All public members are thread safe. */
 class ProgramOutputMultiplexer {
 public:
-    void appendLine(int port, ProcessId pid, const char* line);
+    void appendLine(int port, ProcessId pid, const std::string& name, const char* line);
     /** @return up to 100000 characters of the most recent log output. */
     std::string str() const;
     void clear();
@@ -80,10 +80,8 @@ public:
     ProcessId pidForPort(int port) const;
     /** @return port (-1 if doesn't exist) for a registered pid. */
     int portForPid(ProcessId pid) const;
-    /** @return name for a registered program */
-    std::string programName(ProcessId pid) const;
     /** Register an unregistered program. */
-    void registerProgram(ProcessId pid, int output, int port = 0, std::string name = "sh");
+    void registerProgram(ProcessId pid, int output, int port = 0);
     void deleteProgram(ProcessId pid);
 
     bool isPidRegistered(ProcessId pid) const;
@@ -91,9 +89,8 @@ public:
     void getRegisteredPids(std::vector<ProcessId>& pids);
 
 private:
-    std::unordered_map<int, ProcessId> _portToPidMap;
-    std::unordered_map<ProcessId, int> _outputs;
-    std::unordered_map<ProcessId, std::string> _programNames;
+    stdx::unordered_map<int, ProcessId> _portToPidMap;
+    stdx::unordered_map<ProcessId, int> _outputs;
     mutable stdx::recursive_mutex _mutex;
 
 #ifdef _WIN32

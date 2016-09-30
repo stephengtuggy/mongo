@@ -15,6 +15,7 @@ Coverity
 Coverity's
 DB's
 DBTs
+DONTNEED
 Datastore
 DbCursor
 DbEnv
@@ -80,6 +81,7 @@ SCons
 Seward's
 SiH
 TXT
+UNC
 URIs
 WILLNEED
 WiredTiger
@@ -215,6 +217,8 @@ failchk
 fallocate
 fd's
 fdatasync
+fextend
+fh
 fieldname
 fileID
 fileformats
@@ -229,6 +233,7 @@ forw
 fput
 freelist
 fsync
+ftruncate
 gcc
 gdbm
 ge
@@ -368,6 +373,7 @@ php
 png
 posix
 pre
+prepends
 primary's
 printf
 printlog
@@ -411,6 +417,7 @@ runtime
 rwlock
 sHQ
 sHq
+sanitization
 scalable
 scanf
 schemas
@@ -499,3 +506,4 @@ wtstats
 xa
 yieldcpu
 zlib
+zseries

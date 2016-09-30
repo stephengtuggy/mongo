@@ -598,10 +598,8 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
-        AllowedIndices* allowedIndicesRaw;
-        if (querySettings->getAllowedIndices(planCacheKey, &allowedIndicesRaw)) {
+        if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(planCacheKey)) {
             // Found an index filter set on the query shape.
-            std::unique_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
             indexFilterSet = true;
         }
     }
@@ -678,8 +676,9 @@ void Explain::generateServerInfo(BSONObjBuilder* out) {
     BSONObjBuilder serverBob(out->subobjStart("serverInfo"));
     out->append("host", getHostNameCached());
     out->appendNumber("port", serverGlobalParams.port);
-    out->append("version", versionString);
-    out->append("gitVersion", gitVersion());
+    auto&& vii = VersionInfoInterface::instance();
+    out->append("version", vii.version());
+    out->append("gitVersion", vii.gitVersion());
     serverBob.doneFast();
 }
 
@@ -723,12 +722,17 @@ void Explain::explainStages(PlanExecutor* exec,
         executePlanStatus = exec->executePlan();
     }
 
+    // If executing the query failed because it was killed, then the collection may no longer be
+    // valid. We indicate this by setting our collection pointer to null.
+    if (executePlanStatus == ErrorCodes::QueryPlanKilled) {
+        collection = nullptr;
+    }
+
     // Get stats for the winning plan. If there is only a single candidate plan, it is considered
     // the winner.
     unique_ptr<PlanStageStats> winningStats(
         mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
             : std::move(exec->getStats()));
-
 
     //
     // Use the stats trees to produce explain BSON.

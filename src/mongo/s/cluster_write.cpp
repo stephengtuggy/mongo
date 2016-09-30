@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
@@ -59,13 +60,18 @@ using std::map;
 using std::string;
 using std::stringstream;
 
+using IndexVersion = IndexDescriptor::IndexVersion;
+
 namespace {
 
 /**
  * Constructs the BSON specification document for the given namespace, index key
  * and options.
  */
-BSONObj createIndexDoc(const string& ns, const BSONObj& keys, bool unique) {
+BSONObj createIndexDoc(const string& ns,
+                       const BSONObj& keys,
+                       const BSONObj& collation,
+                       bool unique) {
     BSONObjBuilder indexDoc;
     indexDoc.append("ns", ns);
     indexDoc.append("key", keys);
@@ -91,6 +97,12 @@ BSONObj createIndexDoc(const string& ns, const BSONObj& keys, bool unique) {
     }
 
     indexDoc.append("name", indexName.str());
+
+    if (!collation.isEmpty()) {
+        // Creating an index with the "collation" option requires a v=2 index.
+        indexDoc.append("v", static_cast<int>(IndexVersion::kV2));
+        indexDoc.append("collation", collation);
+    }
 
     if (unique) {
         indexDoc.appendBool("unique", unique);
@@ -133,9 +145,10 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
          ++it) {
         shared_ptr<Chunk> chunk;
         try {
-            chunk = chunkManager->findIntersectingChunk(txn, it->first);
+            chunk = chunkManager->findIntersectingChunkWithSimpleCollation(txn, it->first);
         } catch (const AssertionException& ex) {
-            warning() << "could not find chunk while checking for auto-split: " << causedBy(ex);
+            warning() << "could not find chunk while checking for auto-split: "
+                      << causedBy(redact(ex));
             return;
         }
 
@@ -145,11 +158,12 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
 
 }  // namespace
 
-Status clusterCreateIndex(OperationContext* txn, const string& ns, BSONObj keys, bool unique) {
+Status clusterCreateIndex(
+    OperationContext* txn, const string& ns, BSONObj keys, BSONObj collation, bool unique) {
     const NamespaceString nss(ns);
     const std::string dbName = nss.db().toString();
 
-    BSONObj indexDoc = createIndexDoc(ns, keys, unique);
+    BSONObj indexDoc = createIndexDoc(ns, keys, collation, unique);
 
     // Go through the shard insert path
     std::unique_ptr<BatchedInsertRequest> insert(new BatchedInsertRequest());

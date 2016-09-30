@@ -32,6 +32,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -52,9 +53,7 @@ class CollectionBulkLoaderMock : public CollectionBulkLoader {
 public:
     CollectionBulkLoaderMock(CollectionMockStats* collStats) : stats(collStats){};
     virtual ~CollectionBulkLoaderMock() = default;
-    virtual Status init(OperationContext* txn,
-                        Collection* coll,
-                        const std::vector<BSONObj>& secondaryIndexSpecs) override;
+    virtual Status init(Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     virtual Status insertDocuments(const std::vector<BSONObj>::const_iterator begin,
                                    const std::vector<BSONObj>::const_iterator end) override;
@@ -76,11 +75,8 @@ public:
                           const std::vector<BSONObj>::const_iterator) { return Status::OK(); };
     stdx::function<Status()> abortFn = []() { return Status::OK(); };
     stdx::function<Status()> commitFn = []() { return Status::OK(); };
-    stdx::function<Status(
-        OperationContext* txn, Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs)>
-        initFn = [](OperationContext*, Collection*, const std::vector<BSONObj>&) {
-            return Status::OK();
-        };
+    stdx::function<Status(Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs)>
+        initFn = [](Collection*, const std::vector<BSONObj>&) { return Status::OK(); };
 };
 
 class StorageInterfaceMock : public StorageInterface {
@@ -107,12 +103,17 @@ public:
         stdx::function<Status(OperationContext* txn, const NamespaceString& nss)>;
     using FindOneFn = stdx::function<StatusWith<BSONObj>(OperationContext* txn,
                                                          const NamespaceString& nss,
-                                                         const BSONObj& indexKeyPattern,
-                                                         ScanDirection scanDirection)>;
+                                                         boost::optional<StringData> indexName,
+                                                         ScanDirection scanDirection,
+                                                         const BSONObj& startKey,
+                                                         BoundInclusion boundInclusion)>;
     using DeleteOneFn = stdx::function<StatusWith<BSONObj>(OperationContext* txn,
                                                            const NamespaceString& nss,
-                                                           const BSONObj& indexKeyPattern,
-                                                           ScanDirection scanDirection)>;
+                                                           boost::optional<StringData> indexName,
+                                                           ScanDirection scanDirection,
+                                                           const BSONObj& startKey,
+                                                           BoundInclusion boundInclusion)>;
+    using IsAdminDbValidFn = stdx::function<Status(OperationContext* txn)>;
 
     StorageInterfaceMock() = default;
 
@@ -123,11 +124,13 @@ public:
     void setInitialSyncFlag(OperationContext* txn) override;
     void clearInitialSyncFlag(OperationContext* txn) override;
 
-    BatchBoundaries getMinValid(OperationContext* txn) const override;
-    void setMinValid(OperationContext* txn,
-                     const OpTime& endOpTime,
-                     const DurableRequirement durReq) override;
-    void setMinValid(OperationContext* txn, const BatchBoundaries& boundaries) override;
+    OpTime getMinValid(OperationContext* txn) const override;
+    void setMinValid(OperationContext* txn, const OpTime& minValid) override;
+    void setMinValidToAtLeast(OperationContext* txn, const OpTime& minValid) override;
+    void setOplogDeleteFromPoint(OperationContext* txn, const Timestamp& timestamp) override;
+    Timestamp getOplogDeleteFromPoint(OperationContext* txn) override;
+    void setAppliedThrough(OperationContext* txn, const OpTime& optime) override;
+    OpTime getAppliedThrough(OperationContext* txn) override;
 
     StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
@@ -157,6 +160,10 @@ public:
         return createOplogFn(txn, nss);
     };
 
+    StatusWith<size_t> getOplogMaxSize(OperationContext* txn, const NamespaceString& nss) override {
+        return 1024 * 1024 * 1024;
+    }
+
     Status createCollection(OperationContext* txn,
                             const NamespaceString& nss,
                             const CollectionOptions& options) override {
@@ -169,20 +176,24 @@ public:
 
     StatusWith<BSONObj> findOne(OperationContext* txn,
                                 const NamespaceString& nss,
-                                const BSONObj& indexKeyPattern,
-                                ScanDirection scanDirection) override {
-        return findOneFn(txn, nss, indexKeyPattern, scanDirection);
+                                boost::optional<StringData> indexName,
+                                ScanDirection scanDirection,
+                                const BSONObj& startKey,
+                                BoundInclusion boundInclusion) override {
+        return findOneFn(txn, nss, indexName, scanDirection, startKey, boundInclusion);
     }
 
     StatusWith<BSONObj> deleteOne(OperationContext* txn,
                                   const NamespaceString& nss,
-                                  const BSONObj& indexKeyPattern,
-                                  ScanDirection scanDirection) override {
-        return deleteOneFn(txn, nss, indexKeyPattern, scanDirection);
+                                  boost::optional<StringData> indexName,
+                                  ScanDirection scanDirection,
+                                  const BSONObj& startKey,
+                                  BoundInclusion boundInclusion) override {
+        return deleteOneFn(txn, nss, indexName, scanDirection, startKey, boundInclusion);
     }
 
     Status isAdminDbValid(OperationContext* txn) override {
-        return Status::OK();
+        return isAdminDbValidFn(txn);
     };
 
 
@@ -218,15 +229,22 @@ public:
     };
     FindOneFn findOneFn = [](OperationContext* txn,
                              const NamespaceString& nss,
-                             const BSONObj& indexKeyPattern,
-                             ScanDirection scanDirection) {
+                             boost::optional<StringData> indexName,
+                             ScanDirection scanDirection,
+                             const BSONObj& startKey,
+                             BoundInclusion boundInclusion) {
         return Status{ErrorCodes::IllegalOperation, "FindOneFn not implemented."};
     };
     DeleteOneFn deleteOneFn = [](OperationContext* txn,
                                  const NamespaceString& nss,
-                                 const BSONObj& indexKeyPattern,
-                                 ScanDirection scanDirection) {
+                                 boost::optional<StringData> indexName,
+                                 ScanDirection scanDirection,
+                                 const BSONObj& startKey,
+                                 BoundInclusion boundInclusion) {
         return Status{ErrorCodes::IllegalOperation, "DeleteOneFn not implemented."};
+    };
+    IsAdminDbValidFn isAdminDbValidFn = [](OperationContext*) {
+        return Status{ErrorCodes::IllegalOperation, "IsAdminDbValidFn not implemented."};
     };
 
 private:
@@ -234,7 +252,9 @@ private:
     bool _initialSyncFlag = false;
 
     mutable stdx::mutex _minValidBoundariesMutex;
-    BatchBoundaries _minValidBoundaries = {OpTime(), OpTime()};
+    OpTime _appliedThrough;
+    OpTime _minValid;
+    Timestamp _oplogDeleteFromPoint;
 };
 
 }  // namespace repl

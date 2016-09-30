@@ -49,11 +49,6 @@
 
 namespace mongo {
 
-namespace {
-const Status kInternalErrorStatus{ErrorCodes::InternalError,
-                                  "Invalid to check for write concern error if command failed"};
-}  // namespace
-
 ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
     // Currently ShardLocal only works for config servers. If we ever start using ShardLocal on
     // shards we'll need to consider how to handle shards.
@@ -124,6 +119,7 @@ repl::OpTime ShardLocal::_getLastOpTime() {
 Shard::HostWithResponse ShardLocal::_runCommand(OperationContext* txn,
                                                 const ReadPreferenceSetting& unused,
                                                 const std::string& dbName,
+                                                Milliseconds maxTimeMSOverrideUnused,
                                                 const BSONObj& cmdObj) {
     repl::OpTime currentOpTimeFromClient =
         repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
@@ -139,10 +135,7 @@ Shard::HostWithResponse ShardLocal::_runCommand(OperationContext* txn,
         BSONObj responseMetadata = commandResponse->getMetadata().getOwned();
 
         Status commandStatus = getStatusFromCommandResult(responseReply);
-        Status writeConcernStatus = kInternalErrorStatus;
-        if (commandStatus.isOK()) {
-            writeConcernStatus = getWriteConcernStatusFromCommandResult(responseReply);
-        }
+        Status writeConcernStatus = getWriteConcernStatusFromCommandResult(responseReply);
 
         return Shard::HostWithResponse(boost::none,
                                        Shard::CommandResponse{std::move(responseReply),
@@ -172,18 +165,15 @@ StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
         Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
             txn, repl::ReadConcernArgs{_getLastOpTime(), readConcernLevel});
         if (!readConcernStatus.isOK()) {
-            if (readConcernStatus == ErrorCodes::ShutdownInProgress ||
-                ErrorCodes::isInterruption(readConcernStatus.code())) {
-                return readConcernStatus;
-            }
-
-            fassertStatusOK(40188, readConcernStatus);
+            return readConcernStatus;
         }
 
         // Inform the storage engine to read from the committed snapshot for the rest of this
         // operation.
         status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-        fassertStatusOK(40189, status);
+        if (!status.isOK()) {
+            return status;
+        }
     } else {
         invariant(readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern);
     }

@@ -282,7 +282,7 @@ public:
     AuditingDbMessage(const Message& m) : DbMessage(m) {}
     BSONObj nextJsObj(const char* context) {
         BSONObj ret = DbMessage::nextJsObj();
-        if (objcheck && !ret.valid()) {
+        if (objcheck && !ret.valid(mongo::BSONVersion::kLatest)) {
             // TODO provide more debugging info
             cout << "invalid object in " << context << ": " << ret.hexDump() << endl;
         }
@@ -404,7 +404,7 @@ void processMessage(Connection& c, Message& m) {
             std::shared_ptr<DBClientConnection> conn = forwarder[c];
             if (!conn) {
                 conn.reset(new DBClientConnection(true));
-                uassertStatusOK(conn->connect(mongo::HostAndPort{forwardAddress}));
+                uassertStatusOK(conn->connect(mongo::HostAndPort{forwardAddress}, "mongosniff"));
                 forwarder[c] = conn;
             }
             if (m.operation() == mongo::dbQuery || m.operation() == mongo::dbGetMore) {

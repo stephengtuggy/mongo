@@ -61,6 +61,7 @@ class CollectionCloner : public BaseCloner {
 
 public:
     struct Stats {
+        std::string ns;
         Date_t start;
         Date_t end;
         size_t documents{0};
@@ -69,6 +70,7 @@ public:
 
         std::string toString() const;
         BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
     };
     /**
      * Type of function to schedule storage interface tasks with the executor.
@@ -103,11 +105,11 @@ public:
 
     bool isActive() const override;
 
-    Status start() override;
+    Status startup() override;
 
-    void cancel() override;
+    void shutdown() override;
 
-    void wait() override;
+    void join() override;
 
     CollectionCloner::Stats getStats() const;
 
@@ -128,7 +130,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn(const ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn);
 
 private:
     /**

@@ -29,12 +29,17 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session_id.h"
 #include "mongo/transport/ticket.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+struct SSLPeerInfo;
+
 namespace transport {
 
 class TransportLayer;
@@ -56,6 +61,9 @@ public:
      * Tags for groups of connections.
      */
     using TagMask = uint32_t;
+
+    static const Status ClosedStatus;
+
     static constexpr TagMask kEmptyTagMask = 0;
     static constexpr TagMask kKeepOpen = 1;
 
@@ -97,9 +105,9 @@ public:
     }
 
     /**
-     * Return the X509 subject name for this connection (SSL only).
+     * Return the X509 peer information for this connection (SSL only).
      */
-    std::string getX509SubjectName() const;
+    SSLPeerInfo getX509PeerInfo() const;
 
     /**
      * Set this session's tags. This Session will register
@@ -136,6 +144,10 @@ public:
         return _tl;
     }
 
+    MessageCompressorManager& getCompressorManager() {
+        return _messageCompressorManager;
+    }
+
 private:
     Id _id;
 
@@ -145,6 +157,8 @@ private:
     TagMask _tags;
 
     TransportLayer* _tl;
+
+    MessageCompressorManager _messageCompressorManager;
 };
 
 }  // namespace transport

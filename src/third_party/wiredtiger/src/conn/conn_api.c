@@ -919,7 +919,7 @@ __conn_load_extensions(
 	    WT_CONFIG_BASE(session, WT_CONNECTION_load_extension), NULL, NULL };
 
 	WT_ERR(__wt_config_gets(session, cfg, "extensions", &cval));
-	WT_ERR(__wt_config_subinit(session, &subconfig, &cval));
+	__wt_config_subinit(session, &subconfig, &cval);
 	while ((ret = __wt_config_next(&subconfig, &skey, &sval)) == 0) {
 		if (expath == NULL)
 			WT_ERR(__wt_scr_alloc(session, 0, &expath));
@@ -1020,7 +1020,7 @@ err:	/*
 		}
 
 	/* Release all named snapshots. */
-	WT_TRET(__wt_txn_named_snapshot_destroy(session));
+	__wt_txn_named_snapshot_destroy(session);
 
 	/* Close open, external sessions. */
 	for (s = conn->sessions, i = 0; i < conn->session_cnt; ++s, ++i)
@@ -1055,13 +1055,16 @@ __conn_reconfigure(WT_CONNECTION *wt_conn, const char *config)
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	const char *p;
+	bool locked;
 
 	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	locked = false;
 
 	CONNECTION_API_CALL(conn, session, reconfigure, config, cfg);
 
 	/* Serialize reconfiguration. */
 	__wt_spin_lock(session, &conn->reconfig_lock);
+	locked = true;
 
 	/*
 	 * The configuration argument has been checked for validity, update the
@@ -1096,7 +1099,8 @@ __conn_reconfigure(WT_CONNECTION *wt_conn, const char *config)
 	__wt_free(session, conn->cfg);
 	conn->cfg = p;
 
-err:	__wt_spin_unlock(session, &conn->reconfig_lock);
+err:	if (locked)
+		__wt_spin_unlock(session, &conn->reconfig_lock);
 
 	API_END_RET(session, ret);
 }
@@ -1117,11 +1121,11 @@ __conn_open_session(WT_CONNECTION *wt_conn,
 	*wt_sessionp = NULL;
 
 	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	session_ret = NULL;
 
 	CONNECTION_API_CALL(conn, session, open_session, config, cfg);
 	WT_UNUSED(cfg);
 
+	session_ret = NULL;
 	WT_ERR(__wt_open_session(
 	    conn, event_handler, config, true, &session_ret));
 	*wt_sessionp = &session_ret->iface;
@@ -1217,7 +1221,8 @@ __conn_config_file(WT_SESSION_IMPL *session,
 		return (0);
 
 	/* Open the configuration file. */
-	WT_RET(__wt_open(session, filename, WT_OPEN_FILE_TYPE_REGULAR, 0, &fh));
+	WT_RET(__wt_open(
+	    session, filename, WT_FS_OPEN_FILE_TYPE_REGULAR, 0, &fh));
 	WT_ERR(__wt_filesize(session, fh, &size));
 	if (size == 0)
 		goto err;
@@ -1510,8 +1515,8 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 	exist = false;
 	if (!is_create)
 		WT_ERR(__wt_fs_exist(session, WT_WIREDTIGER, &exist));
-	ret = __wt_open(session, WT_SINGLETHREAD, WT_OPEN_FILE_TYPE_REGULAR,
-	    is_create || exist ? WT_OPEN_CREATE : 0, &conn->lock_fh);
+	ret = __wt_open(session, WT_SINGLETHREAD, WT_FS_OPEN_FILE_TYPE_REGULAR,
+	    is_create || exist ? WT_FS_OPEN_CREATE : 0, &conn->lock_fh);
 
 	/*
 	 * If this is a read-only connection and we cannot grab the lock
@@ -1554,7 +1559,7 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 		 */
 #define	WT_SINGLETHREAD_STRING	"WiredTiger lock file\n"
 		WT_ERR(__wt_filesize(session, conn->lock_fh, &size));
-		if (size != strlen(WT_SINGLETHREAD_STRING))
+		if ((size_t)size != strlen(WT_SINGLETHREAD_STRING))
 			WT_ERR(__wt_write(session, conn->lock_fh, (wt_off_t)0,
 			    strlen(WT_SINGLETHREAD_STRING),
 			    WT_SINGLETHREAD_STRING));
@@ -1563,7 +1568,8 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 
 	/* We own the lock file, optionally create the WiredTiger file. */
 	ret = __wt_open(session, WT_WIREDTIGER,
-	    WT_OPEN_FILE_TYPE_REGULAR, is_create ? WT_OPEN_CREATE : 0, &fh);
+	    WT_FS_OPEN_FILE_TYPE_REGULAR, is_create ? WT_FS_OPEN_CREATE : 0,
+	    &fh);
 
 	/*
 	 * If we're read-only, check for handled errors. Even if able to open
@@ -1655,7 +1661,7 @@ __conn_statistics_config(WT_SESSION_IMPL *session, const char *cfg[])
 	set = 0;
 	if ((ret = __wt_config_subgets(
 	    session, &cval, "none", &sval)) == 0 && sval.val != 0) {
-		LF_SET(WT_CONN_STAT_NONE);
+		flags = 0;
 		++set;
 	}
 	WT_RET_NOTFOUND_OK(ret);
@@ -1675,8 +1681,13 @@ __conn_statistics_config(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_RET_NOTFOUND_OK(ret);
 
 	if ((ret = __wt_config_subgets(
-	    session, &cval, "clear", &sval)) == 0 && sval.val != 0)
+	    session, &cval, "clear", &sval)) == 0 && sval.val != 0) {
+		if (!LF_ISSET(WT_CONN_STAT_FAST | WT_CONN_STAT_ALL))
+			WT_RET_MSG(session, EINVAL,
+			    "the value \"clear\" can be specified only if "
+			    "either \"all\" or \"fast\" is specified");
 		LF_SET(WT_CONN_STAT_CLEAR);
+	}
 	WT_RET_NOTFOUND_OK(ret);
 
 	if (set > 1)
@@ -1725,6 +1736,7 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
 		{ "shared_cache",	WT_VERB_SHARED_CACHE },
 		{ "split",		WT_VERB_SPLIT },
 		{ "temporary",		WT_VERB_TEMPORARY },
+		{ "thread_group",	WT_VERB_THREAD_GROUP },
 		{ "transaction",	WT_VERB_TRANSACTION },
 		{ "verify",		WT_VERB_VERIFY },
 		{ "version",		WT_VERB_VERSION },
@@ -1784,7 +1796,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 	 * runs.  This doesn't matter for correctness, it's just cleaning up
 	 * random files.
 	 */
-	WT_RET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
+	WT_RET(__wt_remove_if_exists(session, WT_BASECONFIG_SET, false));
 
 	/*
 	 * The base configuration file is only written if creating the database,
@@ -1809,7 +1821,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 		return (0);
 
 	WT_RET(__wt_fopen(session, WT_BASECONFIG_SET,
-	    WT_OPEN_CREATE | WT_OPEN_EXCLUSIVE, WT_STREAM_WRITE, &fs));
+	    WT_FS_OPEN_CREATE | WT_FS_OPEN_EXCLUSIVE, WT_STREAM_WRITE, &fs));
 
 	WT_ERR(__wt_fprintf(session, fs, "%s\n\n",
 	    "# Do not modify this file.\n"
@@ -1851,7 +1863,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 	    "readonly=,"
 	    "use_environment_priv=,"
 	    "verbose=,", &base_config));
-	WT_ERR(__wt_config_init(session, &parser, base_config));
+	__wt_config_init(session, &parser, base_config);
 	while ((ret = __wt_config_next(&parser, &k, &v)) == 0) {
 		/* Fix quoting for non-trivial settings. */
 		if (v.type == WT_CONFIG_ITEM_STRING) {
@@ -1870,7 +1882,8 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 	if (0) {
 		/* Close open file handle, remove any temporary file. */
 err:		WT_TRET(__wt_fclose(session, &fs));
-		WT_TRET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
+		WT_TRET(
+		    __wt_remove_if_exists(session, WT_BASECONFIG_SET, false));
 	}
 
 	__wt_free(session, base_config);
@@ -2005,7 +2018,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	session->name = "wiredtiger_open";
 
 	/* Do standard I/O and error handling first. */
-	WT_ERR(__wt_os_stdio(session));
+	__wt_os_stdio(session);
 	__wt_event_handler_set(session, event_handler);
 
 	/*
@@ -2267,8 +2280,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	conn->page_size = __wt_get_vm_pagesize();
 
 	/* Now that we know if verbose is configured, output the version. */
-	WT_ERR(__wt_verbose(
-	    session, WT_VERB_VERSION, "%s", WIREDTIGER_VERSION_STRING));
+	__wt_verbose(session, WT_VERB_VERSION, "%s", WIREDTIGER_VERSION_STRING);
 
 	/*
 	 * Open the connection, then reset the local session as the real one

@@ -179,15 +179,6 @@ public:
         return _data[pos];
     }
 
-    /**
-     * Functor compatible with std::hash for std::unordered_{map,set}
-     * Warning: The hash function is subject to change. Do not use in cases where hashes need
-     *          to be consistent across versions.
-     */
-    struct Hasher {
-        size_t operator()(StringData str) const;
-    };
-
     //
     // iterators
     //
@@ -340,6 +331,18 @@ inline bool StringData::endsWith(StringData suffix) const {
     if (suffixSize > thisSize)
         return false;
     return substr(thisSize - suffixSize) == suffix;
+}
+
+inline std::string operator+(std::string lhs, StringData rhs) {
+    if (!rhs.empty())
+        lhs.append(rhs.rawData(), rhs.size());
+    return lhs;
+}
+
+inline std::string operator+(StringData lhs, std::string rhs) {
+    if (!lhs.empty())
+        rhs.insert(0, lhs.rawData(), lhs.size());
+    return rhs;
 }
 
 }  // namespace mongo

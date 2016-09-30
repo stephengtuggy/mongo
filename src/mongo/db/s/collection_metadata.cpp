@@ -32,6 +32,7 @@
 
 #include "mongo/db/s/collection_metadata.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/stdx/memory.h"
@@ -46,7 +47,18 @@ using std::string;
 using std::vector;
 using str::stream;
 
-CollectionMetadata::CollectionMetadata() = default;
+CollectionMetadata::CollectionMetadata()
+    : _pendingMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()),
+      _chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()),
+      _rangesMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()) {}
+
+CollectionMetadata::CollectionMetadata(const BSONObj& keyPattern, ChunkVersion collectionVersion)
+    : _collVersion(collectionVersion),
+      _shardVersion(ChunkVersion(0, 0, collectionVersion.epoch())),
+      _keyPattern(keyPattern.getOwned()),
+      _pendingMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()),
+      _chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()),
+      _rangesMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()) {}
 
 CollectionMetadata::~CollectionMetadata() = default;
 
@@ -136,8 +148,8 @@ std::unique_ptr<CollectionMetadata> CollectionMetadata::clonePlusPending(
         RangeVector pendingOverlap;
         getRangeMapOverlap(_pendingMap, chunk.getMin(), chunk.getMax(), &pendingOverlap);
 
-        warning() << "new pending chunk " << rangeToString(chunk.getMin(), chunk.getMax())
-                  << " overlaps existing pending chunks " << overlapToString(pendingOverlap)
+        warning() << "new pending chunk " << redact(rangeToString(chunk.getMin(), chunk.getMax()))
+                  << " overlaps existing pending chunks " << redact(overlapToString(pendingOverlap))
                   << ", a migration may not have completed";
 
         for (RangeVector::iterator it = pendingOverlap.begin(); it != pendingOverlap.end(); ++it) {
@@ -196,7 +208,7 @@ StatusWith<std::unique_ptr<CollectionMetadata>> CollectionMetadata::cloneSplit(
         // Check that the split key is valid
         if (!rangeContains(minKey, maxKey, split)) {
             return {ErrorCodes::IllegalOperation,
-                    stream() << "cannot split chunk " << rangeToString(minKey, maxKey) << " at key "
+                    stream() << "Cannot split chunk " << rangeToString(minKey, maxKey) << " at key "
                              << split};
         }
 
@@ -388,10 +400,10 @@ bool CollectionMetadata::getDifferentChunk(const BSONObj& chunkMinKey,
     return false;
 }
 
-BSONObj CollectionMetadata::toBSON() const {
-    BSONObjBuilder bb;
-    toBSON(bb);
-    return bb.obj();
+void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
+    _collVersion.addToBSON(bb, "collVersion");
+    _shardVersion.addToBSON(bb, "shardVersion");
+    bb.append("keyPattern", _keyPattern);
 }
 
 void CollectionMetadata::toBSONChunks(BSONArrayBuilder& bb) const {
@@ -418,18 +430,9 @@ void CollectionMetadata::toBSONPending(BSONArrayBuilder& bb) const {
     }
 }
 
-void CollectionMetadata::toBSON(BSONObjBuilder& bb) const {
-    _collVersion.addToBSON(bb, "collVersion");
-    _shardVersion.addToBSON(bb, "shardVersion");
-    bb.append("keyPattern", _keyPattern);
-
-    BSONArrayBuilder chunksBB(bb.subarrayStart("chunks"));
-    toBSONChunks(chunksBB);
-    chunksBB.done();
-
-    BSONArrayBuilder pendingBB(bb.subarrayStart("pending"));
-    toBSONPending(pendingBB);
-    pendingBB.done();
+string CollectionMetadata::toStringBasic() const {
+    return stream() << "collection version: " << _collVersion.toString()
+                    << ", shard version: " << _shardVersion.toString();
 }
 
 bool CollectionMetadata::getNextOrphanRange(const BSONObj& origLookupKey, KeyRange* range) const {
@@ -512,21 +515,6 @@ bool CollectionMetadata::getNextOrphanRange(const BSONObj& origLookupKey, KeyRan
     return false;
 }
 
-string CollectionMetadata::toString() const {
-    StringBuilder ss;
-    ss << " CollectionManager version: " << _shardVersion.toString() << " key: " << _keyPattern;
-    if (_rangesMap.empty()) {
-        return ss.str();
-    }
-
-    RangeMap::const_iterator it = _rangesMap.begin();
-    ss << it->first << " -> " << it->second;
-    while (it != _rangesMap.end()) {
-        ss << ", " << it->first << " -> " << it->second;
-    }
-    return ss.str();
-}
-
 BSONObj CollectionMetadata::getMinKey() const {
     BSONObjIterator it(_keyPattern);
     BSONObjBuilder minKeyB;
@@ -595,7 +583,7 @@ void CollectionMetadata::fillRanges() {
             max = currMax;
             continue;
         }
-        if (max == currMin) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(max == currMin)) {
             max = currMax;
             continue;
         }

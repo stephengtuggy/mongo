@@ -33,10 +33,13 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/commands/dbhash.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/scripting/engine.h"
 
 namespace mongo {
@@ -76,9 +79,18 @@ void OpObserver::onInserts(OperationContext* txn,
         }
     }
 
+    if (nss.ns() == FeatureCompatibilityVersion::kCollection) {
+        for (auto it = begin; it != end; it++) {
+            FeatureCompatibilityVersion::onInsertOrUpdate(*it);
+        }
+    }
+
     logOpForDbHash(txn, ns);
     if (strstr(ns, ".system.js")) {
         Scope::storedFuncMod(txn);
+    }
+    if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(txn, nss);
     }
 }
 
@@ -101,12 +113,21 @@ void OpObserver::onUpdate(OperationContext* txn, const OplogUpdateEntryArgs& arg
     if (strstr(args.ns.c_str(), ".system.js")) {
         Scope::storedFuncMod(txn);
     }
+
+    NamespaceString nss(args.ns);
+    if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(txn, nss);
+    }
+
+    if (args.ns == FeatureCompatibilityVersion::kCollection) {
+        FeatureCompatibilityVersion::onInsertOrUpdate(args.updatedDoc);
+    }
 }
 
-OpObserver::DeleteState OpObserver::aboutToDelete(OperationContext* txn,
-                                                  const NamespaceString& ns,
-                                                  const BSONObj& doc) {
-    OpObserver::DeleteState deleteState;
+CollectionShardingState::DeleteState OpObserver::aboutToDelete(OperationContext* txn,
+                                                               const NamespaceString& ns,
+                                                               const BSONObj& doc) {
+    CollectionShardingState::DeleteState deleteState;
     BSONElement idElement = doc["_id"];
     if (!idElement.eoo()) {
         deleteState.idDoc = idElement.wrap();
@@ -120,7 +141,7 @@ OpObserver::DeleteState OpObserver::aboutToDelete(OperationContext* txn,
 
 void OpObserver::onDelete(OperationContext* txn,
                           const NamespaceString& ns,
-                          OpObserver::DeleteState deleteState,
+                          CollectionShardingState::DeleteState deleteState,
                           bool fromMigrate) {
     if (deleteState.idDoc.isEmpty())
         return;
@@ -130,13 +151,19 @@ void OpObserver::onDelete(OperationContext* txn,
         ->logOp(txn, "d", ns.ns().c_str(), deleteState.idDoc, nullptr);
 
     auto css = CollectionShardingState::get(txn, ns.ns());
-    if (!fromMigrate && deleteState.isMigrating) {
-        css->onDeleteOp(txn, deleteState.idDoc);
+    if (!fromMigrate) {
+        css->onDeleteOp(txn, deleteState);
     }
 
     logOpForDbHash(txn, ns.ns().c_str());
     if (ns.coll() == "system.js") {
         Scope::storedFuncMod(txn);
+    }
+    if (ns.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(txn, ns);
+    }
+    if (ns.ns() == FeatureCompatibilityVersion::kCollection) {
+        FeatureCompatibilityVersion::onDelete(deleteState.idDoc);
     }
 }
 
@@ -195,7 +222,15 @@ void OpObserver::onDropCollection(OperationContext* txn, const NamespaceString& 
         repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
     }
 
+    if (collectionName.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(txn, collectionName);
+    }
+
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
+
+    auto css = CollectionShardingState::get(txn, collectionName);
+    css->onDropCollection(txn, collectionName);
+
     logOpForDbHash(txn, dbName.c_str());
 }
 
@@ -221,6 +256,11 @@ void OpObserver::onRenameCollection(OperationContext* txn,
                                 << dropTarget);
 
     repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+    if (fromCollection.coll() == DurableViewCatalog::viewsCollectionName() ||
+        toCollection.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(
+            txn, NamespaceString(DurableViewCatalog::viewsCollectionName()));
+    }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
     logOpForDbHash(txn, dbName.c_str());

@@ -35,6 +35,7 @@
 #include <set>
 
 #include "mongo/base/init.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/config.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
@@ -83,7 +84,7 @@ ASIOMessagingPort::ASIOMessagingPort(int fd, SockAddr farEnd)
       _remote(),
       _isEncrypted(false),
       _awaitingHandshake(true),
-      _x509SubjectName(),
+      _x509PeerInfo(),
       _bytesIn(0),
       _bytesOut(0),
       _logLevel(logger::LogSeverity::Log()),
@@ -121,7 +122,7 @@ ASIOMessagingPort::ASIOMessagingPort(Milliseconds timeout, logger::LogSeverity l
       _remote(),
       _isEncrypted(false),
       _awaitingHandshake(true),
-      _x509SubjectName(),
+      _x509PeerInfo(),
       _bytesIn(0),
       _bytesOut(0),
       _logLevel(logLevel),
@@ -350,8 +351,8 @@ bool ASIOMessagingPort::recv(Message& m) {
         }
 
         if (_awaitingHandshake) {
-            static_assert(sizeof(kGET) - 1 <= kHeaderLen,
-                          "HTTP GET string must be smaller than the message header.");
+            MONGO_STATIC_ASSERT_MSG(sizeof(kGET) - 1 <= kHeaderLen,
+                                    "HTTP GET string must be smaller than the message header.");
             if (memcmp(md.view2ptr(), kGET, strlen(kGET)) == 0) {
                 std::string httpMsg =
                     "It looks like you are trying to access MongoDB over HTTP on the native driver "
@@ -383,13 +384,13 @@ bool ASIOMessagingPort::recv(Message& m) {
                     throw asio::system_error(ec);
                 }
 
-                auto swPeerSubjectName =
+                auto swPeerInfo =
                     getSSLManager()->parseAndValidatePeerCertificate(_sslSock.native_handle(), "");
-                if (!swPeerSubjectName.isOK()) {
+                if (!swPeerInfo.isOK()) {
                     throw SocketException(SocketException::CONNECT_ERROR,
-                                          swPeerSubjectName.getStatus().reason());
+                                          swPeerInfo.getStatus().reason());
                 }
-                setX509SubjectName(swPeerSubjectName.getValue().get_value_or(""));
+                setX509PeerInfo(swPeerInfo.getValue().get_value_or(SSLPeerInfo()));
 
                 _isEncrypted = true;
                 _awaitingHandshake = false;
@@ -427,7 +428,7 @@ bool ASIOMessagingPort::recv(Message& m) {
         return true;
 
     } catch (const asio::system_error& e) {
-        LOG(_logLevel) << "SocketException: remote: " << remote() << " error: " << e.what();
+        LOG(_logLevel) << "SocketException: remote: " << remote() << " error: " << redact(e.what());
         m.reset();
         return false;
     }
@@ -590,13 +591,12 @@ bool ASIOMessagingPort::secure(SSLManagerInterface* ssl, const std::string& remo
         return false;
     }
 
-    auto swPeerSubjectName =
+    auto swPeerInfo =
         getSSLManager()->parseAndValidatePeerCertificate(_sslSock.native_handle(), remoteHost);
-    if (!swPeerSubjectName.isOK()) {
-        throw SocketException(SocketException::CONNECT_ERROR,
-                              swPeerSubjectName.getStatus().reason());
+    if (!swPeerInfo.isOK()) {
+        throw SocketException(SocketException::CONNECT_ERROR, swPeerInfo.getStatus().reason());
     }
-    setX509SubjectName(swPeerSubjectName.getValue().get_value_or(""));
+    setX509PeerInfo(swPeerInfo.getValue().get_value_or(SSLPeerInfo()));
 
     _isEncrypted = true;
     return true;
@@ -630,12 +630,12 @@ long long ASIOMessagingPort::getBytesOut() const {
     return _bytesOut;
 }
 
-void ASIOMessagingPort::setX509SubjectName(const std::string& x509SubjectName) {
-    _x509SubjectName = x509SubjectName;
+void ASIOMessagingPort::setX509PeerInfo(SSLPeerInfo x509PeerInfo) {
+    _x509PeerInfo = std::move(x509PeerInfo);
 }
 
-std::string ASIOMessagingPort::getX509SubjectName() const {
-    return _x509SubjectName;
+const SSLPeerInfo& ASIOMessagingPort::getX509PeerInfo() const {
+    return _x509PeerInfo;
 }
 
 void ASIOMessagingPort::setConnectionId(const long long connectionId) {

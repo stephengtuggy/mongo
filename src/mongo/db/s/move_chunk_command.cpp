@@ -66,13 +66,13 @@ DistLockManager::ScopedDistLock acquireCollectionDistLock(OperationContext* txn,
                             << ChunkRange(args.getMinKey(), args.getMaxKey()).toString()
                             << " in "
                             << args.getNss().ns());
-    auto distLockStatus =
-        Grid::get(txn)->catalogClient(txn)->distLock(txn, args.getNss().ns(), whyMessage);
+    auto distLockStatus = Grid::get(txn)->catalogClient(txn)->getDistLockManager()->lock(
+        txn, args.getNss().ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
     if (!distLockStatus.isOK()) {
         const string msg = str::stream()
             << "Could not acquire collection lock for " << args.getNss().ns()
-            << " to migrate chunk [" << args.getMinKey() << "," << args.getMaxKey() << ") due to "
-            << distLockStatus.getStatus().toString();
+            << " to migrate chunk [" << redact(args.getMinKey()) << "," << redact(args.getMaxKey())
+            << ") due to " << distLockStatus.getStatus().toString();
         warning() << msg;
         uasserted(distLockStatus.getStatus().code(), msg);
     }
@@ -86,7 +86,7 @@ DistLockManager::ScopedDistLock acquireCollectionDistLock(OperationContext* txn,
  */
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
-        warning() << "Chunk move failed" << causedBy(status);
+        warning() << "Chunk move failed" << causedBy(redact(status));
         uassertStatusOK(status);
     }
 }
@@ -119,7 +119,7 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -156,7 +156,7 @@ public:
         grid.shardRegistry()->reload(txn);
 
         auto scopedRegisterMigration =
-            uassertStatusOK(shardingState->registerMigration(moveChunkRequest));
+            uassertStatusOK(shardingState->registerDonateChunk(moveChunkRequest));
 
         Status status = {ErrorCodes::InternalError, "Uninitialized value"};
 
@@ -275,7 +275,7 @@ private:
             // This is an immediate delete, and as a consequence, there could be more
             // deletes happening simultaneously than there are deleter worker threads.
             if (!getDeleter()->deleteNow(txn, deleterOptions, &errMsg)) {
-                log() << "Error occured while performing cleanup: " << errMsg;
+                log() << "Error occured while performing cleanup: " << redact(errMsg);
             }
         } else {
             log() << "forking for cleanup of chunk data";
@@ -285,7 +285,7 @@ private:
                                            deleterOptions,
                                            NULL,  // Don't want to be notified
                                            &errMsg)) {
-                log() << "could not queue migration cleanup: " << errMsg;
+                log() << "could not queue migration cleanup: " << redact(errMsg);
             }
         }
 

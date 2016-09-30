@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
 namespace mongo {
@@ -38,7 +38,7 @@ namespace mongo {
  */
 class ShardingCatalogClientMock : public ShardingCatalogClient {
 public:
-    ShardingCatalogClientMock();
+    ShardingCatalogClientMock(std::unique_ptr<DistLockManager> distLockManager);
     ~ShardingCatalogClientMock();
 
     Status startup() override;
@@ -50,6 +50,7 @@ public:
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
                            const ShardKeyPattern& fieldsAndOrder,
+                           const BSONObj& defaultCollation,
                            bool unique,
                            const std::vector<BSONObj>& initPoints,
                            const std::set<ShardId>& initShardIds) override;
@@ -87,7 +88,8 @@ public:
                      const BSONObj& sort,
                      boost::optional<int> limit,
                      std::vector<ChunkType>* chunks,
-                     repl::OpTime* opTime) override;
+                     repl::OpTime* opTime,
+                     repl::ReadConcernLevel readConcern) override;
 
     Status getTagsForCollection(OperationContext* txn,
                                 const std::string& collectionNs,
@@ -98,7 +100,7 @@ public:
                                            const ChunkType& chunk) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-        OperationContext* txn) override;
+        OperationContext* txn, repl::ReadConcernLevel readConcern) override;
 
     bool runUserManagementWriteCommand(OperationContext* txn,
                                        const std::string& commandName,
@@ -115,7 +117,9 @@ public:
                                    const BSONArray& updateOps,
                                    const BSONArray& preCondition,
                                    const std::string& nss,
-                                   const ChunkVersion& lastChunkVersion) override;
+                                   const ChunkVersion& lastChunkVersion,
+                                   const WriteConcernOptions& writeConcern,
+                                   repl::ReadConcernLevel readConcern) override;
 
     Status logAction(OperationContext* txn,
                      const std::string& what,
@@ -125,7 +129,8 @@ public:
     Status logChange(OperationContext* txn,
                      const std::string& what,
                      const std::string& ns,
-                     const BSONObj& detail) override;
+                     const BSONObj& detail,
+                     const WriteConcernOptions& writeConcern) override;
 
     StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) override;
 
@@ -157,16 +162,11 @@ public:
 
     DistLockManager* getDistLockManager() override;
 
-    StatusWith<DistLockManager::ScopedDistLock> distLock(OperationContext* txn,
-                                                         StringData name,
-                                                         StringData whyMessage,
-                                                         Milliseconds waitFor) override;
-
     Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                               BSONArrayBuilder* builder) override;
 
 private:
-    std::unique_ptr<DistLockManagerMock> _mockDistLockMgr;
+    std::unique_ptr<DistLockManager> _distLockManager;
 };
 
 }  // namespace mongo

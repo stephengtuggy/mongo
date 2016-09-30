@@ -39,7 +39,7 @@ namespace executor {
 
 void logCloseFailed(std::error_code ec) {
     invariant(ec);
-    LOG(1) << "failed to close stream: " << ec.message();
+    log() << "failed to close stream: " << ec.message();
 }
 
 void logFailureInSetStreamNonBlocking(std::error_code ec) {
@@ -55,7 +55,7 @@ void logFailureInSetStreamNoDelay(std::error_code ec) {
 void logUnexpectedErrorInCheckOpen(std::error_code ec) {
     invariant(ec);
     log() << "unexpected error when checking if a stream was open: " << ec.message()
-          << ", the only error we expected was EOF";
+          << ", the only errors we expect are EOF and network/connection reset";
 }
 
 

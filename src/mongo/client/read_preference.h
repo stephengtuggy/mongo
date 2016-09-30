@@ -28,7 +28,9 @@
 
 #pragma once
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -102,7 +104,7 @@ public:
     }
 
     bool operator==(const TagSet& other) const {
-        return _tags == other._tags;
+        return SimpleBSONObjComparator::kInstance.evaluate(_tags == other._tags);
     }
     bool operator!=(const TagSet& other) const {
         return !(*this == other);
@@ -121,12 +123,13 @@ struct ReadPreferenceSetting {
      *     position).
      */
     ReadPreferenceSetting(ReadPreference pref, TagSet tags, Milliseconds maxStalenessMS);
+    ReadPreferenceSetting(ReadPreference pref, Milliseconds maxStalenessMS);
     ReadPreferenceSetting(ReadPreference pref, TagSet tags);
     explicit ReadPreferenceSetting(ReadPreference pref);
 
     inline bool equals(const ReadPreferenceSetting& other) const {
         return (pref == other.pref) && (tags == other.tags) &&
-            (maxStalenessMS == other.maxStalenessMS);
+            (maxStalenessMS == other.maxStalenessMS) && (minOpTime == other.minOpTime);
     }
 
     /**
@@ -153,6 +156,12 @@ struct ReadPreferenceSetting {
     ReadPreference pref;
     TagSet tags;
     Milliseconds maxStalenessMS{};
+    repl::OpTime minOpTime{};
+
+    /**
+     * The minimal value maxStalenessMS can have. It MUST be ReplicaSetMonitor::kRefreshPeriod * 2
+     */
+    static const Milliseconds kMinimalMaxStalenessValue;
 };
 
 }  // namespace mongo

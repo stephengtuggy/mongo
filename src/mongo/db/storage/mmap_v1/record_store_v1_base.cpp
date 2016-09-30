@@ -33,6 +33,7 @@
 #include "mongo/db/storage/mmap_v1/record_store_v1_base.h"
 
 
+#include "mongo/base/static_assert.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
@@ -86,10 +87,9 @@ const int RecordStoreV1Base::bucketSizes[] = {
 };
 
 // If this fails, it means that bucketSizes doesn't have the correct number of entries.
-static_assert(sizeof(RecordStoreV1Base::bucketSizes) / sizeof(RecordStoreV1Base::bucketSizes[0]) ==
-                  RecordStoreV1Base::Buckets,
-              "sizeof(RecordStoreV1Base::bucketSizes) / sizeof(RecordStoreV1Base::bucketSizes[0]) "
-              "== RecordStoreV1Base::Buckets");
+MONGO_STATIC_ASSERT(sizeof(RecordStoreV1Base::bucketSizes) /
+                        sizeof(RecordStoreV1Base::bucketSizes[0]) ==
+                    RecordStoreV1Base::Buckets);
 
 SavedCursorRegistry::~SavedCursorRegistry() {
     for (SavedCursorSet::iterator it = _cursors.begin(); it != _cursors.end(); it++) {
@@ -728,7 +728,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
                             results->errors.push_back("invalid object detected (see logs)");
 
                         nInvalid++;
-                        log() << "Invalid object detected in " << _ns << ": " << status.reason();
+                        log() << "Invalid object detected in " << _ns << ": " << redact(status);
                     } else {
                         bsonLen += dataSize;
                     }

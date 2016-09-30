@@ -137,9 +137,10 @@ public:
     virtual bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) = 0;
 
     /**
-     * Runs a command against this shard and returns the BSON command response, as well as the
-     * already-parsed out Status of the command response and write concern error (if present).
-     * Retries failed operations according to the given "retryPolicy".
+     * Runs the specified command returns the BSON command response plus parsed out Status of this
+     * response and write concern error (if present). Retries failed operations according to the
+     * given "retryPolicy".  Retries indefinitely until/unless a non-retriable error is encountered,
+     * the maxTimeMs on the OperationContext expires, or the operation is interrupted.
      */
     StatusWith<CommandResponse> runCommand(OperationContext* txn,
                                            const ReadPreferenceSetting& readPref,
@@ -148,12 +149,49 @@ public:
                                            RetryPolicy retryPolicy);
 
     /**
-     * Executes the specified batch write command on this shard's primary and retries on the
-     * specified set of errors using the specified retry policy.
+     * Same as the other variant of runCommand, but allows the operation timeout to be overriden.
+     * Runs for the lesser of the remaining time on the operation context or the specified maxTimeMS
+     * override.
      */
-    BatchedCommandResponse runBatchWriteCommand(OperationContext* txn,
-                                                const BatchedCommandRequest& batchRequest,
-                                                RetryPolicy retryPolicy);
+    StatusWith<CommandResponse> runCommand(OperationContext* txn,
+                                           const ReadPreferenceSetting& readPref,
+                                           const std::string& dbName,
+                                           const BSONObj& cmdObj,
+                                           Milliseconds maxTimeMSOverride,
+                                           RetryPolicy retryPolicy);
+
+    /**
+     * Same as runCommand, but will only retry failed operations up to 3 times, regardless of
+     * the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommand.
+     */
+    StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
+        OperationContext* txn,
+        const ReadPreferenceSetting& readPref,
+        const std::string& dbName,
+        const BSONObj& cmdObj,
+        RetryPolicy retryPolicy);
+
+    /**
+     * Same as runCommand, but will only retry failed operations up to 3 times, regardless of
+     * the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommand.
+     */
+    StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
+        OperationContext* txn,
+        const ReadPreferenceSetting& readPref,
+        const std::string& dbName,
+        const BSONObj& cmdObj,
+        Milliseconds maxTimeMSOverride,
+        RetryPolicy retryPolicy);
+
+    /**
+     * Expects a single-entry batch wrtie command and runs it on the config server's primary using
+     * the specified retry policy.
+     */
+    BatchedCommandResponse runBatchWriteCommandOnConfig(OperationContext* txn,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        RetryPolicy retryPolicy);
 
     /**
     * Warning: This method exhausts the cursor and pulls all data into memory.
@@ -181,6 +219,9 @@ public:
                                        const BSONObj& keys,
                                        bool unique) = 0;
 
+    // This timeout will be used by default in operations against the config server, unless
+    // explicitly overridden
+    static const Milliseconds kDefaultConfigCommandTimeout;
 
 protected:
     struct HostWithResponse {
@@ -196,12 +237,17 @@ protected:
 
 private:
     /**
-     * Paired HostWithResponse output exposes RemoteShard's host for updateReplSetMonitor.
-     * LocalShard will not return a host.
+     * Runs the specified command against the shard backed by this object with a timeout set to the
+     * minimum of maxTimeMSOverride or the timeout of the OperationContext.
+     *
+     * The return value exposes RemoteShard's host for calls to updateReplSetMonitor.
+     *
+     * NOTE: LocalShard implementation will not return a valid host and so should be ignored.
      */
     virtual HostWithResponse _runCommand(OperationContext* txn,
                                          const ReadPreferenceSetting& readPref,
                                          const std::string& dbname,
+                                         Milliseconds maxTimeMSOverride,
                                          const BSONObj& cmdObj) = 0;
 
     virtual StatusWith<QueryResponse> _exhaustiveFindOnConfig(

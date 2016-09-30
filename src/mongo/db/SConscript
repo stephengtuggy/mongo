@@ -159,6 +159,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/query/command_request_response',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/progress_meter',
@@ -341,6 +342,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         # The dependency on network is a temporary crutch that should go away once the
         # networking library has separate options
         '$BUILD_DIR/mongo/util/net/network',
@@ -397,10 +399,12 @@ env.Library(
         "dbwebserver.cpp",
         "initialize_server_global_state.cpp",
         "server_extra_log_context.cpp",
+        "server_options_init.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/client/clientdriver",
         "$BUILD_DIR/mongo/db/auth/authservercommon",
+        "$BUILD_DIR/mongo/logger/max_log_size",
         "$BUILD_DIR/mongo/rpc/command_reply",
         "$BUILD_DIR/mongo/rpc/command_request",
         "$BUILD_DIR/mongo/rpc/metadata",
@@ -471,7 +475,6 @@ env.Library(
     target='service_context',
     source=[
         'client.cpp',
-        'client_basic.cpp',
         'operation_context.cpp',
         'service_context.cpp',
         'service_context_noop.cpp',
@@ -549,6 +552,20 @@ env.Library(
     ],
     LIBDEPS=[
         "commands",
+    ],
+)
+
+env.CppUnitTest(
+    target="commands_test",
+    source=[
+        "commands_test.cpp",
+    ],
+    LIBDEPS=[
+        "commands",
+        "commands_test_crutch",
+        "service_context_noop_init",
+        "auth/authorization_manager_mock_init",
+        "repl/replmocks",
     ],
 )
 
@@ -640,8 +657,8 @@ serveronlyLibdeps = [
     "$BUILD_DIR/mongo/client/parallel",
     "$BUILD_DIR/mongo/db/bson/dotted_path_support",
     "$BUILD_DIR/mongo/executor/network_interface_factory",
-    "$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl",
-    "$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl",
+    "$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl",
+    "$BUILD_DIR/mongo/s/catalog/sharding_catalog_manager_impl",
     "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
     "$BUILD_DIR/mongo/s/coreshard",
     "$BUILD_DIR/mongo/s/shard_id",
@@ -652,6 +669,7 @@ serveronlyLibdeps = [
     "$BUILD_DIR/mongo/util/net/network",
     "$BUILD_DIR/mongo/db/storage/mmap_v1/file_allocator",
     "$BUILD_DIR/third_party/shim_snappy",
+    '$BUILD_DIR/mongo/db/ttl_collection_cache',
     "auth/authmongod",
     "catalog/catalog",
     "catalog/collection_options",
@@ -685,10 +703,10 @@ serveronlyLibdeps = [
     "repl/bgsync",
     "repl/oplog_buffer_collection",
     "repl/oplog_buffer_blocking_queue",
+    "repl/oplog_buffer_proxy",
     "repl/repl_coordinator_global",
     "repl/repl_coordinator_impl",
     "repl/repl_settings",
-    "repl/replset_commands",
     "repl/rs_rollback",
     "repl/rslog",
     "repl/serveronly",
@@ -711,7 +729,7 @@ serveronlyLibdeps = [
     "storage/storage_engine_metadata",
     "storage/storage_options",
     "update_index_data",
-    "views/views",
+    "views/views_mongod",
 ]
 
 if wiredtiger:
@@ -758,5 +776,16 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/server_parameters',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+    ],
+)
+
+env.Library(
+    target='ttl_collection_cache',
+    source=[
+        'ttl_collection_cache.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )

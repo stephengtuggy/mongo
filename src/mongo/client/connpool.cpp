@@ -235,7 +235,7 @@ DBClientBase* DBConnectionPool::get(const ConnectionString& url, double socketTi
     }
 
     string errmsg;
-    c = url.connect(errmsg, socketTimeout);
+    c = url.connect(StringData(), errmsg, socketTimeout);
     uassert(13328, _name + ": connect failed " + url.toString() + " : " + errmsg, c);
 
     return _finishCreate(url.toString(), socketTimeout, c);
@@ -256,7 +256,7 @@ DBClientBase* DBConnectionPool::get(const string& host, double socketTimeout) {
     const ConnectionString cs(uassertStatusOK(ConnectionString::parse(host)));
 
     string errmsg;
-    c = cs.connect(errmsg, socketTimeout);
+    c = cs.connect(StringData(), errmsg, socketTimeout);
     if (!c)
         throw SocketException(SocketException::CONNECT_ERROR,
                               host,
@@ -361,11 +361,11 @@ void DBConnectionPool::appendConnectionStats(executor::ConnectionPoolStats* stat
             invariant(uri.isOK());
             HostAndPort host = uri.getValue().getServers().front();
 
-            executor::ConnectionStatsPerHost hostStats{
-                static_cast<size_t>(i->second.numInUse()),
-                static_cast<size_t>(i->second.numAvailable()),
-                static_cast<size_t>(i->second.numCreated())};
-            stats->updateStatsForHost(host, hostStats);
+            executor::ConnectionStatsPer hostStats{static_cast<size_t>(i->second.numInUse()),
+                                                   static_cast<size_t>(i->second.numAvailable()),
+                                                   static_cast<size_t>(i->second.numCreated()),
+                                                   0};
+            stats->updateStatsForHost("global", host, hostStats);
         }
     }
 }

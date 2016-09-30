@@ -17,7 +17,7 @@ env.Library(
         'server_status_metric.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/net/hostname_canonicalization_worker',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/base'
         ]
     )
@@ -66,11 +66,13 @@ env.Library(
         '$BUILD_DIR/mongo/db/startup_warnings_common',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/timer_stats',
+        '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         '$BUILD_DIR/mongo/scripting/scripting_common',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/foundation',
@@ -101,6 +103,7 @@ env.Library(
         "drop_indexes.cpp",
         "eval.cpp",
         "explain_cmd.cpp",
+        "feature_compatibility_version.cpp",
         "find_and_modify.cpp",
         "find_cmd.cpp",
         "fsync.cpp",
@@ -123,6 +126,7 @@ env.Library(
         "plan_cache_commands.cpp",
         "rename_collection_cmd.cpp",
         "repair_cursor.cpp",
+        "set_feature_compatibility_version_command.cpp",
         "snapshot_management.cpp",
         "test_commands.cpp",
         "top_command.cpp",
@@ -132,6 +136,7 @@ env.Library(
         "write_commands/write_commands.cpp",
     ],
     LIBDEPS=[
+        'apply_ops_cmd_common',
         'core',
         'killcursors_common',
         '$BUILD_DIR/mongo/base',
@@ -147,6 +152,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/pipeline/serveronly',
         '$BUILD_DIR/mongo/db/repl/isself',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/stats/serveronly',
         '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
     ],
@@ -166,6 +172,42 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
         '$BUILD_DIR/mongo/db/query/command_request_response',
+    ],
+)
+
+env.Library(
+    target='apply_ops_cmd_common',
+    source=[
+        'apply_ops_cmd_common.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/document_validation',
+        '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+
+env.Library(
+    target="list_collections_filter",
+    source=[
+        'list_collections_filter.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target="list_collections_filter_test",
+    source=[
+        "list_collections_filter_test.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/list_collections_filter',
     ],
 )
 

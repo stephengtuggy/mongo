@@ -92,7 +92,13 @@ void ServiceEntryPointMongos::_sessionLoop(Session* session) {
         {
             auto status = session->sourceMessage(&message).wait();
 
-            if (ErrorCodes::isInterruption(status.code())) {
+            if (ErrorCodes::isInterruption(status.code()) ||
+                ErrorCodes::isNetworkError(status.code())) {
+                break;
+            }
+
+            // Our session may have been closed internally.
+            if (status == TransportLayer::TicketSessionClosedStatus) {
                 break;
             }
 

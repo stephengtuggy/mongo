@@ -123,21 +123,11 @@ int ProgramRegistry::portForPid(ProcessId pid) const {
     return -1;
 }
 
-std::string ProgramRegistry::programName(ProcessId pid) const {
-    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    if (!isPidRegistered(pid)) {
-        // It could be that the program has attempted to log something before it was registered.
-        return "sh";
-    }
-    return _programNames.find(pid)->second;
-}
-
-void ProgramRegistry::registerProgram(ProcessId pid, int output, int port, std::string name) {
+void ProgramRegistry::registerProgram(ProcessId pid, int output, int port) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     verify(!isPidRegistered(pid));
     _portToPidMap.emplace(port, pid);
     _outputs.emplace(pid, output);
-    _programNames.emplace(pid, name);
 }
 
 void ProgramRegistry::deleteProgram(ProcessId pid) {
@@ -147,7 +137,6 @@ void ProgramRegistry::deleteProgram(ProcessId pid) {
     }
     close(_outputs.find(pid)->second);
     _outputs.erase(pid);
-    _programNames.erase(pid);
     _portToPidMap.erase(portForPid(pid));
 }
 
@@ -199,11 +188,13 @@ void ProgramRegistry::insertHandleForPid(ProcessId pid, HANDLE handle) {
 
 ProgramRegistry& registry = *(new ProgramRegistry());
 
-void ProgramOutputMultiplexer::appendLine(int port, ProcessId pid, const char* line) {
+void ProgramOutputMultiplexer::appendLine(int port,
+                                          ProcessId pid,
+                                          const std::string& name,
+                                          const char* line) {
     stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
     uassert(28695, "program is terminating", !mongo::inShutdown());
     stringstream buf;
-    string name = registry.programName(pid);
     if (port > 0)
         buf << name << port << "| " << line;
     else
@@ -243,18 +234,9 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
         _name = "s";
     } else if (program == "mongobridge") {
         _name = "b";
+    } else {
+        _name = "sh";
     }
-
-#if 0
-            if (isMongosProgram == "mongos") {
-                _argv.push_back("valgrind");
-                _argv.push_back("--log-file=/tmp/mongos-%p.valgrind");
-                _argv.push_back("--leak-check=yes");
-                _argv.push_back("--suppressions=valgrind.suppressions");
-                //_argv.push_back("--error-exitcode=1");
-                _argv.push_back("--");
-            }
-#endif
 
     _argv.push_back(programPath.string());
 
@@ -335,13 +317,13 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
     else {
         if (_port <= 0)
             log() << "error: a port number is expected when running " << program
-                  << " from the shell" << endl;
+                  << " from the shell";
         verify(_port > 0);
     }
     if (_port > 0) {
         bool haveDbForPort = registry.isPortRegistered(_port);
         if (haveDbForPort) {
-            log() << "already have db for port: " << _port << endl;
+            log() << "already have db for port: " << _port;
             verify(!haveDbForPort);
         }
     }
@@ -351,7 +333,7 @@ void ProgramRunner::start() {
     int pipeEnds[2];
     int status = pipe(pipeEnds);
     if (status != 0) {
-        error() << "failed to create pipe: " << errnoWithDescription() << endl;
+        error() << "failed to create pipe: " << errnoWithDescription();
         fassertFailed(16701);
     }
 
@@ -360,7 +342,7 @@ void ProgramRunner::start() {
     launchProcess(pipeEnds[1]);  // sets _pid
 
     if (_port > 0)
-        registry.registerProgram(_pid, pipeEnds[1], _port, _name);
+        registry.registerProgram(_pid, pipeEnds[1], _port);
     else
         registry.registerProgram(_pid, pipeEnds[1]);
     _pipe = pipeEnds[0];
@@ -371,7 +353,7 @@ void ProgramRunner::start() {
         for (unsigned i = 0; i < _argv.size(); i++) {
             ss << " " << _argv[i];
         }
-        log() << ss.str() << endl;
+        log() << ss.str();
     }
 }
 
@@ -386,8 +368,8 @@ void ProgramRunner::operator()() {
         while (1) {
             int lenToRead = (bufSize - 1) - (start - buf);
             if (lenToRead <= 0) {
-                log() << "error: lenToRead: " << lenToRead << endl;
-                log() << "first 300: " << string(buf, 0, 300) << endl;
+                log() << "error: lenToRead: " << lenToRead;
+                log() << "first 300: " << string(buf, 0, 300);
             }
             verify(lenToRead > 0);
             int ret = read(_pipe, (void*)start, lenToRead);
@@ -397,15 +379,15 @@ void ProgramRunner::operator()() {
             start[ret] = '\0';
             if (strlen(start) != unsigned(ret))
                 programOutputLogger.appendLine(
-                    _port, _pid, "WARNING: mongod wrote null bytes to output");
+                    _port, _pid, _name, "WARNING: mongod wrote null bytes to output");
             char* last = buf;
             for (char *i = strchr(buf, '\n'); i; last = i + 1, i = strchr(last, '\n')) {
                 *i = '\0';
-                programOutputLogger.appendLine(_port, _pid, last);
+                programOutputLogger.appendLine(_port, _pid, _name, last);
             }
             if (ret == 0) {
                 if (*last)
-                    programOutputLogger.appendLine(_port, _pid, last);
+                    programOutputLogger.appendLine(_port, _pid, _name, last);
                 close(_pipe);
                 break;
             }
@@ -496,15 +478,9 @@ void ProgramRunner::launchProcess(int child_stdout) {
         }
     }
 
-    string args = ss.str();
+    std::wstring args = toNativeString(ss.str().c_str());
 
     // Construct the environment block which the new process will use.
-    std::unique_ptr<TCHAR[]> args_tchar(new TCHAR[args.size() + 1]);
-    size_t i;
-    for (i = 0; i < args.size(); i++)
-        args_tchar[i] = args[i];
-    args_tchar[i] = 0;
-
     // An environment block is a NULL terminated array of NULL terminated WCHAR strings. The
     // strings are of the form "name=value\0". Because the strings are variable length, we must
     // precompute the size of the array before we may allocate it.
@@ -555,7 +531,7 @@ void ProgramRunner::launchProcess(int child_stdout) {
     dwCreationFlags |= CREATE_UNICODE_ENVIRONMENT;
 
     bool success = CreateProcessW(nullptr,
-                                  args_tchar.get(),
+                                  const_cast<LPWSTR>(args.c_str()),
                                   nullptr,
                                   nullptr,
                                   true,
@@ -674,7 +650,10 @@ bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
     }
 #else
     int tmp;
-    bool ret = (pid.toNative() == waitpid(pid.toNative(), &tmp, (block ? 0 : WNOHANG)));
+    int ret;
+    do {
+        ret = waitpid(pid.toNative(), &tmp, (block ? 0 : WNOHANG));
+    } while (ret == -1 && errno == EINTR);
     if (ret && exit_code) {
         if (WIFEXITED(tmp)) {
             *exit_code = WEXITSTATUS(tmp);
@@ -684,7 +663,7 @@ bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
             MONGO_UNREACHABLE;
         }
     }
-    return ret;
+    return ret == pid.toNative();
 
 #endif
 }
@@ -794,7 +773,15 @@ void copyDir(const boost::filesystem::path& from, const boost::filesystem::path&
     boost::filesystem::directory_iterator i(from);
     while (i != end) {
         boost::filesystem::path p = *i;
-        if (p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock") {
+        if (p.leaf() == "metrics.interim" || p.leaf() == "metrics.interim.temp") {
+            // Ignore any errors for metrics.interim* files as these may disappear during copy
+            boost::system::error_code ec;
+            boost::filesystem::copy_file(p, to / p.leaf(), ec);
+            if (ec) {
+                log() << "Skipping copying of file from '" << p.generic_string() << "' to '"
+                      << (to / p.leaf()).generic_string() << "' due to: " << ec.message();
+            }
+        } else if (p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock") {
             if (boost::filesystem::is_directory(p)) {
                 boost::filesystem::path newDir = to / p.leaf();
                 boost::filesystem::create_directory(newDir);
@@ -848,7 +835,8 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
             //
             try {
                 DBClientConnection conn;
-                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)});
+                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)},
+                             "MongoDB Shell");
 
                 BSONElement authObj = opt["auth"];
 
@@ -887,7 +875,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
     if (x) {
         if (errno == ESRCH) {
         } else {
-            log() << "killFailed: " << errnoWithDescription() << endl;
+            log() << "killFailed: " << errnoWithDescription();
             verify(x == 0);
         }
     }
@@ -897,7 +885,6 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
 
 int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt) {
     ProcessId pid;
-    int exitCode = 0;
     if (port > 0) {
         if (!registry.isPortRegistered(port)) {
             log() << "No db started on port: " << port;
@@ -910,32 +897,18 @@ int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt) {
 
     kill_wrapper(pid, signal, port, opt);
 
-    bool processTerminated = false;
-    bool killSignalSent = (signal == SIGKILL);
-    for (int i = 0; i < 6000; ++i) {
-        if (i == 600) {
-            log() << "process on port " << port << ", with pid " << pid
-                  << " not terminated, sending sigkill";
-            kill_wrapper(pid, SIGKILL, port, opt);
-            killSignalSent = true;
-        }
-        processTerminated = wait_for_pid(pid, false, &exitCode);
-        if (processTerminated) {
-            break;
-        }
-        sleepmillis(100);
-    }
-    if (!processTerminated) {
-        severe() << "failed to terminate process on port " << port << ", with pid " << pid;
-        invariant(false);
-    }
-
+    int exitCode = EXIT_FAILURE;
+    bool processTerminated = wait_for_pid(pid, true, &exitCode);
     registry.deleteProgram(pid);
 
-    if (killSignalSent) {
+    if (signal == SIGKILL) {
         sleepmillis(4000);  // allow operating system to reclaim resources
     }
 
+    if (!processTerminated) {
+        warning() << "process " << pid << " failed to terminate.";
+        return EXIT_FAILURE;
+    }
     return exitCode;
 }
 
@@ -978,7 +951,7 @@ BSONObj StopMongoProgram(const BSONObj& a, void* data) {
     uassert(15853, "stopMongo needs a number", a.firstElement().isNumber());
     int port = int(a.firstElement().number());
     int code = killDb(port, ProcessId::fromNative(0), getSignal(a), getStopMongodOpts(a));
-    log() << "shell: stopped mongo program on port " << port << endl;
+    log() << "shell: stopped mongo program on port " << port;
     return BSON("" << (double)code);
 }
 
@@ -987,16 +960,22 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
     uassert(15852, "stopMongoByPid needs a number", a.firstElement().isNumber());
     ProcessId pid = ProcessId::fromNative(int(a.firstElement().number()));
     int code = killDb(0, pid, getSignal(a));
-    log() << "shell: stopped mongo program on pid " << pid << endl;
+    log() << "shell: stopped mongo program on pid " << pid;
     return BSON("" << (double)code);
 }
 
-void KillMongoProgramInstances() {
+int KillMongoProgramInstances() {
     vector<ProcessId> pids;
     registry.getRegisteredPids(pids);
+    int returnCode = EXIT_SUCCESS;
     for (auto&& pid : pids) {
-        killDb(0, pid, SIGTERM);
+        int port = registry.portForPid(pid);
+        int code = killDb(port != -1 ? port : 0, pid, SIGTERM);
+        if (code != EXIT_SUCCESS) {
+            returnCode = code;
+        }
     }
+    return returnCode;
 }
 
 MongoProgramScope::~MongoProgramScope() {

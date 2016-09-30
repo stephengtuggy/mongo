@@ -15,6 +15,16 @@ env.SConscript(
 )
 
 env.Library(
+    target='version_impl',
+    source=[
+        'version_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
+env.Library(
     target='intrusive_counter',
     source=[
         'intrusive_counter.cpp',
@@ -229,10 +239,13 @@ env.Library(
     source=[
         "fail_point.cpp",
         "fail_point_registry.cpp",
+        "fail_point_server_parameter.cpp",
         "fail_point_service.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/bson/util/bson_extract",
+        "$BUILD_DIR/mongo/db/server_parameters",
     ],
 )
 
@@ -294,6 +307,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         source=[
             'tcmalloc_server_status_section.cpp',
             'tcmalloc_set_parameter.cpp',
+            'heap_profiler.cpp',
         ],
         LIBDEPS=[
             # TODO: This is needless, the definition of
@@ -548,5 +562,25 @@ if env.TargetOSIs('linux'):
         ],
         LIBDEPS=[
             'procparser',
+        ])
+
+if env.TargetOSIs('windows'):
+    env.Library(
+        target='perfctr_collect',
+        source=[
+            "perfctr_collect.cpp",
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/platform/platform',
         ],
     )
+
+    env.CppUnitTest(
+        target='perfctr_collect_test',
+        source=[
+            'perfctr_collect_test.cpp',
+        ],
+        LIBDEPS=[
+            'perfctr_collect',
+        ])

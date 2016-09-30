@@ -30,6 +30,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/s/balancer/cluster_statistics.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
@@ -39,17 +40,17 @@ namespace mongo {
 class ChunkManager;
 class OperationContext;
 
-struct TagRange {
-    TagRange() = default;
+struct ZoneRange {
+    ZoneRange() = default;
 
-    TagRange(const BSONObj& a_min, const BSONObj& a_max, const std::string& a_tag)
-        : min(a_min.getOwned()), max(a_max.getOwned()), tag(a_tag) {}
+    ZoneRange(const BSONObj& a_min, const BSONObj& a_max, const std::string& _zone)
+        : min(a_min.getOwned()), max(a_max.getOwned()), zone(_zone) {}
 
     std::string toString() const;
 
     BSONObj min;
     BSONObj max;
-    std::string tag;
+    std::string zone;
 };
 
 struct MigrateInfo {
@@ -59,6 +60,13 @@ struct MigrateInfo {
           from(a_chunk.getShard()),
           minKey(a_chunk.getMin()),
           maxKey(a_chunk.getMax()) {}
+
+    MigrateInfo(const std::string& a_ns,
+                const ShardId& a_to,
+                const ShardId& a_from,
+                const BSONObj& a_minKey,
+                const BSONObj& a_maxKey)
+        : ns(a_ns), to(a_to), from(a_from), minKey(a_minKey), maxKey(a_maxKey) {}
 
     std::string getName() const;
     std::string toString() const;
@@ -93,10 +101,10 @@ public:
     }
 
     /**
-     * Appends the specified range to the set of ranges tracked for this collection and checks its
-     * valididty. Returns true if the range is valid or false otherwise.
+     * Appends the specified range to the set of ranges tracked for this collection and checks if
+     * it overlaps with existing ranges.
      */
-    bool addTagRange(const TagRange& range);
+    Status addRangeToZone(const ZoneRange& range);
 
     /**
      * Returns total number of chunks across all shards.
@@ -127,8 +135,8 @@ public:
     /**
      * Returns all tag ranges defined for the collection.
      */
-    const std::map<BSONObj, TagRange, BSONObjCmp>& tagRanges() const {
-        return _tagRanges;
+    const BSONObjIndexedMap<ZoneRange>& tagRanges() const {
+        return _zoneRanges;
     }
 
     /**
@@ -158,7 +166,7 @@ private:
     ShardToChunksMap _shardChunks;
 
     // Map of zone max key to the zone description
-    std::map<BSONObj, TagRange, BSONObjCmp> _tagRanges;
+    BSONObjIndexedMap<ZoneRange> _zoneRanges;
 
     // Set of all zones defined for this collection
     std::set<std::string> _allTags;

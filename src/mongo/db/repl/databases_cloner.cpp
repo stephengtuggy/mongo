@@ -38,7 +38,9 @@
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
@@ -57,7 +59,8 @@ using Response = executor::RemoteCommandResponse;
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
-const size_t numListDatabasesRetries = 1;
+// The number of attempts for the listDatabases commands.
+MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListDatabasesAttempts, int, 3);
 
 }  // namespace
 
@@ -84,56 +87,46 @@ DatabasesCloner::DatabasesCloner(StorageInterface* si,
     uassert(ErrorCodes::InvalidOptions, "includeDbPred must be provided.", includeDbPred);
 };
 
+DatabasesCloner::~DatabasesCloner() {
+    DESTRUCTOR_GUARD(shutdown(); join(););
+}
+
 std::string DatabasesCloner::toString() const {
+    LockGuard lk(_mutex);
     return str::stream() << "initial sync --"
                          << " active:" << _active << " status:" << _status.toString()
                          << " source:" << _source.toString()
-                         << " db cloners active:" << _clonersActive
+                         << " db cloners completed:" << _stats.databasesCloned
                          << " db count:" << _databaseCloners.size();
 }
 
 void DatabasesCloner::join() {
-    UniqueLock lk(_mutex);
-    if (!_active) {
-        return;
+    if (auto listDatabaseScheduler = _getListDatabasesScheduler()) {
+        listDatabaseScheduler->join();
     }
 
-    std::vector<std::shared_ptr<DatabaseCloner>> clonersToWaitOn;
-    for (auto&& cloner : _databaseCloners) {
-        if (cloner && cloner->isActive()) {
-            clonersToWaitOn.push_back(cloner);
-        }
+    auto databaseCloners = _getDatabaseCloners();
+    for (auto&& cloner : databaseCloners) {
+        cloner->join();
     }
-
-    lk.unlock();
-    for (auto&& cloner : clonersToWaitOn) {
-        cloner->wait();
-    }
-    lk.lock();
 }
 
 void DatabasesCloner::shutdown() {
-    UniqueLock lk(_mutex);
-    if (!_active)
+    if (auto listDatabaseScheduler = _getListDatabasesScheduler()) {
+        listDatabaseScheduler->shutdown();
+    }
+
+    auto databaseCloners = _getDatabaseCloners();
+    for (auto&& cloner : databaseCloners) {
+        cloner->shutdown();
+    }
+
+    LockGuard lk(_mutex);
+    if (!_active) {
         return;
+    }
     _active = false;
     _setStatus_inlock({ErrorCodes::CallbackCanceled, "Initial Sync Cancelled."});
-    _cancelCloners_inlock(lk);
-}
-
-void DatabasesCloner::_cancelCloners_inlock(UniqueLock& lk) {
-    std::vector<std::shared_ptr<DatabaseCloner>> clonersToCancel;
-    for (auto&& cloner : _databaseCloners) {
-        if (cloner && cloner->isActive()) {
-            clonersToCancel.push_back(cloner);
-        }
-    }
-
-    lk.unlock();
-    for (auto&& cloner : clonersToCancel) {
-        cloner->cancel();
-    }
-    lk.lock();
 }
 
 bool DatabasesCloner::isActive() {
@@ -144,6 +137,34 @@ bool DatabasesCloner::isActive() {
 Status DatabasesCloner::getStatus() {
     LockGuard lk(_mutex);
     return _status;
+}
+
+DatabasesCloner::Stats DatabasesCloner::getStats() const {
+    LockGuard lk(_mutex);
+    DatabasesCloner::Stats stats = _stats;
+    for (auto&& databaseCloner : _databaseCloners) {
+        stats.databaseStats.emplace_back(databaseCloner->getStats());
+    }
+    return stats;
+}
+
+std::string DatabasesCloner::Stats::toString() const {
+    return toBSON().toString();
+}
+
+BSONObj DatabasesCloner::Stats::toBSON() const {
+    BSONObjBuilder bob;
+    append(&bob);
+    return bob.obj();
+}
+
+void DatabasesCloner::Stats::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("databasesCloned", databasesCloned);
+    for (auto&& db : databaseStats) {
+        BSONObjBuilder dbBuilder(builder->subobjStart(db.dbname));
+        db.append(&dbBuilder);
+        dbBuilder.doneFast();
+    }
 }
 
 Status DatabasesCloner::startup() {
@@ -161,13 +182,14 @@ Status DatabasesCloner::startup() {
     Request listDBsReq(_source,
                        "admin",
                        BSON("listDatabases" << true),
-                       rpc::ServerSelectionMetadata(true, boost::none).toBSON());
+                       rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                       nullptr);
     _listDBsScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
         _exec,
         listDBsReq,
         stdx::bind(&DatabasesCloner::_onListDatabaseFinish, this, stdx::placeholders::_1),
         RemoteCommandRetryScheduler::makeRetryPolicy(
-            numListDatabasesRetries,
+            numInitialSyncListDatabasesAttempts,
             executor::RemoteCommandRequest::kNoTimeout,
             RemoteCommandRetryScheduler::kAllRetriableErrors));
     auto s = _listDBsScheduler->startup();
@@ -179,10 +201,15 @@ Status DatabasesCloner::startup() {
     return _status;
 }
 
+void DatabasesCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
+    LockGuard lk(_mutex);
+    _scheduleDbWorkFn = work;
+}
+
 void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
-    Status respStatus = cbd.response.getStatus();
+    Status respStatus = cbd.response.status;
     if (respStatus.isOK()) {
-        respStatus = getStatusFromCommandResult(cbd.response.getValue().data);
+        respStatus = getStatusFromCommandResult(cbd.response.data);
     }
 
     UniqueLock lk(_mutex);
@@ -193,7 +220,7 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         return;
     }
 
-    const auto respBSON = cbd.response.getValue().data;
+    const auto respBSON = cbd.response.data;
     // There should not be any cloners yet
     invariant(_databaseCloners.size() == 0);
     const auto dbsElem = respBSON["databases"].Obj();
@@ -207,16 +234,13 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         }
 
         const std::string dbName = dbBSON["name"].str();
-        ++_clonersActive;
         std::shared_ptr<DatabaseCloner> dbCloner{nullptr};
-        Status startStatus(ErrorCodes::NotYetInitialized,
-                           "The DatabasesCloner could not be started.");
 
         // filters for DatabasesCloner.
         const auto collectionFilterPred = [dbName](const BSONObj& collInfo) {
             const auto collName = collInfo["name"].str();
             const NamespaceString ns(dbName, collName);
-            if (ns.isSystem() && !legalClientSystemNS(ns.ns(), true)) {
+            if (ns.isSystem() && !legalClientSystemNS(ns.ns())) {
                 LOG(1) << "Skipping 'system' collection: " << ns.ns();
                 return false;
             }
@@ -239,6 +263,7 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         const auto onDbFinish = [this, dbName](const Status& status) {
             _onEachDBCloneFinish(status, dbName);
         };
+        Status startStatus = Status::OK();
         try {
             dbCloner.reset(new DatabaseCloner(
                 _exec,
@@ -250,8 +275,13 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
                 _storage,  // use storage provided.
                 onCollectionFinish,
                 onDbFinish));
-            // Start database cloner.
-            startStatus = dbCloner->start();
+            if (_scheduleDbWorkFn) {
+                dbCloner->setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+            }
+            // Start first database cloner.
+            if (_databaseCloners.empty()) {
+                startStatus = dbCloner->startup();
+            }
         } catch (...) {
             startStatus = exceptionToStatus();
         }
@@ -279,38 +309,68 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
     }
 }
 
+std::vector<std::shared_ptr<DatabaseCloner>> DatabasesCloner::_getDatabaseCloners() const {
+    LockGuard lock(_mutex);
+    return _databaseCloners;
+}
+
+RemoteCommandRetryScheduler* DatabasesCloner::_getListDatabasesScheduler() const {
+    LockGuard lock(_mutex);
+    return _listDBsScheduler.get();
+}
+
 void DatabasesCloner::_onEachDBCloneFinish(const Status& status, const std::string& name) {
     UniqueLock lk(_mutex);
-    auto clonersLeft = --_clonersActive;
-
     if (!status.isOK()) {
-        warning() << "database '" << name << "' clone failed due to " << status.toString();
+        warning() << "database '" << name << "' (" << (_stats.databasesCloned + 1) << " of "
+                  << _databaseCloners.size() << ") clone failed due to " << status.toString();
         _setStatus_inlock(status);
-        if (clonersLeft == 0) {
-            _failed_inlock(lk);
-        } else {
-            // After cancellation this callback will called until clonersLeft = 0.
-            _cancelCloners_inlock(lk);
-        }
+        _failed_inlock(lk);
         return;
     }
 
-    LOG(2) << "Database clone finished: " << name;
     if (StringData(name).equalCaseInsensitive("admin")) {
         LOG(1) << "Finished the 'admin' db, now calling isAdminDbValid.";
         // Do special checks for the admin database because of auth. collections.
-        const auto adminStatus = _storage->isAdminDbValid(nullptr /* TODO: wire in txn*/);
+        auto adminStatus = Status(ErrorCodes::NotYetInitialized, "");
+        {
+            // TODO: Move isAdminDbValid() out of the collection/database cloner code paths.
+            OperationContext* txn = cc().getOperationContext();
+            ServiceContext::UniqueOperationContext txnPtr;
+            if (!txn) {
+                txnPtr = cc().makeOperationContext();
+                txn = txnPtr.get();
+            }
+            adminStatus = _storage->isAdminDbValid(txn);
+        }
         if (!adminStatus.isOK()) {
+            LOG(1) << "Validation failed on 'admin' db due to " << adminStatus;
             _setStatus_inlock(adminStatus);
+            _failed_inlock(lk);
+            return;
         }
     }
 
-    if (clonersLeft == 0) {
+    _stats.databasesCloned++;
+
+    if (_stats.databasesCloned == _databaseCloners.size()) {
         _active = false;
         // All cloners are done, trigger event.
         LOG(2) << "All database clones finished, calling _finishFn.";
         lk.unlock();
         _finishFn(_status);
+        return;
+    }
+
+    // Start next database cloner.
+    auto&& dbCloner = _databaseCloners[_stats.databasesCloned];
+    auto startStatus = dbCloner->startup();
+    if (!startStatus.isOK()) {
+        warning() << "failed to schedule database '" << name << "' ("
+                  << (_stats.databasesCloned + 1) << " of " << _databaseCloners.size()
+                  << ") due to " << startStatus.toString();
+        _setStatus_inlock(startStatus);
+        _failed_inlock(lk);
         return;
     }
 }

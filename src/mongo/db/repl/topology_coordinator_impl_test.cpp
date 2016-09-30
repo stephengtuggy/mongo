@@ -1502,7 +1502,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             oplogProgress,
             oplogDurable,
             lastCommittedOpTime,
-            readConcernMajorityOpTime},
+            readConcernMajorityOpTime,
+            BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -1511,11 +1512,12 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     // Test results for all non-self members
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_EQUALS(curTime.asInt64(), rsStatus["date"].Date().asInt64());
-    ASSERT_EQUALS(lastCommittedOpTime.toBSON(), rsStatus["optimes"]["lastCommittedOpTime"].Obj());
+    ASSERT_BSONOBJ_EQ(lastCommittedOpTime.toBSON(),
+                      rsStatus["optimes"]["lastCommittedOpTime"].Obj());
     {
         const auto optimes = rsStatus["optimes"].Obj();
-        ASSERT_EQUALS(readConcernMajorityOpTime.toBSON(),
-                      optimes["readConcernMajorityOpTime"].Obj());
+        ASSERT_BSONOBJ_EQ(readConcernMajorityOpTime.toBSON(),
+                          optimes["readConcernMajorityOpTime"].Obj());
         ASSERT_EQUALS(oplogProgress.getTimestamp(), optimes["appliedOpTime"].timestamp());
         ASSERT_EQUALS((oplogDurable).getTimestamp(), optimes["durableOpTime"].timestamp());
     }
@@ -1582,6 +1584,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_TRUE(selfStatus.hasField("optimeDate"));
     ASSERT_EQUALS(Date_t::fromMillisSinceEpoch(oplogProgress.getSecs() * 1000ULL),
                   selfStatus["optimeDate"].Date());
+    ASSERT_FALSE(rsStatus.hasField("initialSyncStatus"));
 
     ASSERT_EQUALS(2000, rsStatus["heartbeatIntervalMillis"].numberInt());
 
@@ -1617,7 +1620,8 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
             oplogProgress,
             oplogProgress,
             OpTime(),
-            OpTime()},
+            OpTime(),
+            BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_NOT_OK(resultStatus);
@@ -2381,7 +2385,8 @@ public:
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
-                                                   OpTime()},
+                                                   OpTime(),
+                                                   BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -2444,7 +2449,8 @@ public:
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
-                                                   OpTime()},
+                                                   OpTime(),
+                                                   BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -2766,7 +2772,8 @@ TEST_F(HeartbeatResponseTestTwoRetries, NodeDoesNotRetryHeartbeatsAfterFailingTw
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
-                                               OpTime()},
+                                               OpTime(),
+                                               BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -3010,7 +3017,8 @@ TEST_F(HeartbeatResponseTestTwoRetries,
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
-                                               OpTime()},
+                                               OpTime(),
+                                               BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -3454,7 +3462,9 @@ TEST_F(HeartbeatResponseTest,
 
     // freeze node to set stepdown wait
     BSONObjBuilder response;
-    getTopoCoord().prepareFreezeResponse(now()++, 20, &response);
+    ASSERT_EQUALS(
+        TopologyCoordinator::PrepareFreezeResponseResult::kNoAction,
+        unittest::assertGet(getTopoCoord().prepareFreezeResponse(now()++, 20, &response)));
 
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0", lastOpTimeApplied);
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
@@ -4402,17 +4412,21 @@ public:
                      0);
     }
 
-    BSONObj prepareFreezeResponse(int duration) {
+    std::pair<StatusWith<TopologyCoordinator::PrepareFreezeResponseResult>, BSONObj>
+    prepareFreezeResponse(int duration) {
         BSONObjBuilder response;
         startCapturingLogMessages();
-        getTopoCoord().prepareFreezeResponse(now()++, duration, &response);
+        auto result = getTopoCoord().prepareFreezeResponse(now()++, duration, &response);
         stopCapturingLogMessages();
-        return response.obj();
+        return std::make_pair(result, response.obj());
     }
 };
 
 TEST_F(PrepareFreezeResponseTest, FreezeForOneSecondWhenToldToFreezeForZeroSeconds) {
-    BSONObj response = prepareFreezeResponse(0);
+    auto result = prepareFreezeResponse(0);
+    ASSERT_EQUALS(TopologyCoordinator::PrepareFreezeResponseResult::kNoAction,
+                  unittest::assertGet(result.first));
+    const auto& response = result.second;
     ASSERT_EQUALS("unfreezing", response["info"].String());
     ASSERT_EQUALS(1, countLogLinesContaining("'unfreezing'"));
     // 1 instead of 0 because it assigns to "now" in this case
@@ -4420,7 +4434,10 @@ TEST_F(PrepareFreezeResponseTest, FreezeForOneSecondWhenToldToFreezeForZeroSecon
 }
 
 TEST_F(PrepareFreezeResponseTest, LogAMessageAndFreezeForOneSecondWhenToldToFreezeForOneSecond) {
-    BSONObj response = prepareFreezeResponse(1);
+    auto result = prepareFreezeResponse(1);
+    ASSERT_EQUALS(TopologyCoordinator::PrepareFreezeResponseResult::kNoAction,
+                  unittest::assertGet(result.first));
+    const auto& response = result.second;
     ASSERT_EQUALS("you really want to freeze for only 1 second?", response["warning"].String());
     ASSERT_EQUALS(1, countLogLinesContaining("'freezing' for 1 seconds"));
     // 1001 because "now" was incremented once during initialization + 1000 ms wait
@@ -4428,7 +4445,10 @@ TEST_F(PrepareFreezeResponseTest, LogAMessageAndFreezeForOneSecondWhenToldToFree
 }
 
 TEST_F(PrepareFreezeResponseTest, FreezeForTheSpecifiedDurationWhenToldToFreeze) {
-    BSONObj response = prepareFreezeResponse(20);
+    auto result = prepareFreezeResponse(20);
+    ASSERT_EQUALS(TopologyCoordinator::PrepareFreezeResponseResult::kNoAction,
+                  unittest::assertGet(result.first));
+    const auto& response = result.second;
     ASSERT_TRUE(response.isEmpty());
     ASSERT_EQUALS(1, countLogLinesContaining("'freezing' for 20 seconds"));
     // 20001 because "now" was incremented once during initialization + 20000 ms wait
@@ -4437,27 +4457,37 @@ TEST_F(PrepareFreezeResponseTest, FreezeForTheSpecifiedDurationWhenToldToFreeze)
 
 TEST_F(PrepareFreezeResponseTest, FreezeForOneSecondWhenToldToFreezeForZeroSecondsWhilePrimary) {
     makeSelfPrimary();
-    BSONObj response = prepareFreezeResponse(0);
-    ASSERT_EQUALS("unfreezing", response["info"].String());
-    // doesn't mention being primary in this case for some reason
-    ASSERT_EQUALS(0, countLogLinesContaining("received freeze command but we are primary"));
-    // 1 instead of 0 because it assigns to "now" in this case
-    ASSERT_EQUALS(1LL, getTopoCoord().getStepDownTime().asInt64());
+    auto result = prepareFreezeResponse(0);
+    ASSERT_EQUALS(ErrorCodes::NotSecondary, result.first);
+    const auto& response = result.second;
+    ASSERT_TRUE(response.isEmpty());
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining(
+                      "cannot freeze node when primary or running for election. state: Primary"));
+    ASSERT_EQUALS(0LL, getTopoCoord().getStepDownTime().asInt64());
 }
 
 TEST_F(PrepareFreezeResponseTest, NodeDoesNotFreezeWhenToldToFreezeForOneSecondWhilePrimary) {
     makeSelfPrimary();
-    BSONObj response = prepareFreezeResponse(1);
-    ASSERT_EQUALS("you really want to freeze for only 1 second?", response["warning"].String());
-    ASSERT_EQUALS(1, countLogLinesContaining("received freeze command but we are primary"));
+    auto result = prepareFreezeResponse(1);
+    ASSERT_EQUALS(ErrorCodes::NotSecondary, result.first);
+    const auto& response = result.second;
+    ASSERT_TRUE(response.isEmpty());
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining(
+                      "cannot freeze node when primary or running for election. state: Primary"));
     ASSERT_EQUALS(0LL, getTopoCoord().getStepDownTime().asInt64());
 }
 
 TEST_F(PrepareFreezeResponseTest, NodeDoesNotFreezeWhenToldToFreezeForSeveralSecondsWhilePrimary) {
     makeSelfPrimary();
-    BSONObj response = prepareFreezeResponse(20);
+    auto result = prepareFreezeResponse(20);
+    ASSERT_EQUALS(ErrorCodes::NotSecondary, result.first);
+    const auto& response = result.second;
     ASSERT_TRUE(response.isEmpty());
-    ASSERT_EQUALS(1, countLogLinesContaining("received freeze command but we are primary"));
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining(
+                      "cannot freeze node when primary or running for election. state: Primary"));
     ASSERT_EQUALS(0LL, getTopoCoord().getStepDownTime().asInt64());
 }
 
@@ -4474,12 +4504,24 @@ TEST_F(TopoCoordTest,
     setSelfMemberState(MemberState::RS_SECONDARY);
 
     BSONObjBuilder response;
-    getTopoCoord().prepareFreezeResponse(now()++, 20, &response);
+    ASSERT_EQUALS(
+        TopologyCoordinator::PrepareFreezeResponseResult::kNoAction,
+        unittest::assertGet(getTopoCoord().prepareFreezeResponse(now()++, 20, &response)));
     ASSERT(response.obj().isEmpty());
     BSONObjBuilder response2;
-    getTopoCoord().prepareFreezeResponse(now()++, 0, &response2);
+    ASSERT_EQUALS(
+        TopologyCoordinator::PrepareFreezeResponseResult::kElectSelf,
+        unittest::assertGet(getTopoCoord().prepareFreezeResponse(now()++, 0, &response2)));
     ASSERT_EQUALS("unfreezing", response2.obj()["info"].String());
     ASSERT(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+
+    // prepareFreezeResult returns error if we are running for election.
+    auto result = getTopoCoord().prepareFreezeResponse(now()++, 20, &response);
+    auto status = result.getStatus();
+    ASSERT_EQUALS(ErrorCodes::NotSecondary, status);
+    ASSERT_STRING_CONTAINS(
+        status.reason(),
+        "cannot freeze node when primary or running for election. state: Running-Election");
 }
 
 class PrepareHeartbeatResponseTest : public TopoCoordTest {

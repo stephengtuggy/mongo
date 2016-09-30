@@ -699,7 +699,7 @@ public:
         s->setObject("z", BSON("z" << (long long)(4)));
         ASSERT(s->exec("y = {y:z.z.top}", "foo", false, true, false));
         out = s->getObject("y");
-        ASSERT_EQUALS(Undefined, out.firstElement().type());
+        ASSERT_EQUALS(NumberDouble, out.firstElement().type());
 
         ASSERT(s->exec("x = {x:z.z.floatApprox}", "foo", false, true, false));
         out = s->getObject("x");
@@ -736,7 +736,7 @@ public:
 
         ASSERT(s->exec((string) "y = " + outString, "foo2", false, true, false));
         BSONObj out = s->getObject("y");
-        ASSERT_EQUALS(in, out);
+        ASSERT_BSONOBJ_EQ(in, out);
     }
 };
 
@@ -789,6 +789,11 @@ public:
 class NumberDecimal {
 public:
     void run() {
+        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
+        // BSONVersion::kLatest.
+        serverGlobalParams.featureCompatibility.version.store(
+            ServerGlobalParams::FeatureCompatibility::Version::k34);
+
         unique_ptr<Scope> s(globalScriptEngine->newScope());
         BSONObjBuilder b;
         Decimal128 val = Decimal128("2.010");
@@ -818,6 +823,11 @@ public:
 class NumberDecimalGetFromScope {
 public:
     void run() {
+        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
+        // BSONVersion::kLatest.
+        serverGlobalParams.featureCompatibility.version.store(
+            ServerGlobalParams::FeatureCompatibility::Version::k34);
+
         unique_ptr<Scope> s(globalScriptEngine->newScope());
         ASSERT(s->exec("a = 5;", "a", false, true, false));
         ASSERT_TRUE(Decimal128(5).isEqual(s->getNumberDecimal("a")));
@@ -827,6 +837,11 @@ public:
 class NumberDecimalBigObject {
 public:
     void run() {
+        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
+        // BSONVersion::kLatest.
+        serverGlobalParams.featureCompatibility.version.store(
+            ServerGlobalParams::FeatureCompatibility::Version::k34);
+
         unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         BSONObj in;
@@ -847,7 +862,7 @@ public:
 
         ASSERT(s->exec((string) "y = " + outString, "foo2", false, true, false));
         BSONObj out = s->getObject("y");
-        ASSERT_EQUALS(in, out);
+        ASSERT_BSONOBJ_EQ(in, out);
     }
 };
 
@@ -1120,6 +1135,11 @@ public:
     virtual ~TestRoundTrip() {}
     void run() {
         // Insert in Javascript -> Find using DBDirectClient
+
+        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
+        // BSONVersion::kLatest.
+        serverGlobalParams.featureCompatibility.version.store(
+            ServerGlobalParams::FeatureCompatibility::Version::k34);
 
         // Drop the collection
         const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
@@ -2183,7 +2203,7 @@ public:
         {
             BSONObjBuilder b;
             s->append(b, "z", "x");
-            ASSERT_EQUALS(BSON("z" << 5), b.obj());
+            ASSERT_BSONOBJ_EQ(BSON("z" << 5), b.obj());
         }
 
         s->invokeSafe("x = function(){ return 17; }", 0, 0);
