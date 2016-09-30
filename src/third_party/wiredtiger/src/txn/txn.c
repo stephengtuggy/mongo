@@ -124,6 +124,7 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 	txn = &session->txn;
 	txn_global = &conn->txn_global;
 	txn_state = WT_SESSION_TXN_STATE(session);
+	n = 0;
 
 	/*
 	 * Spin waiting for the lock: the sleeps in our blocking readlock
@@ -137,20 +138,26 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 	current_id = snap_min = txn_global->current;
 	prev_oldest_id = txn_global->oldest_id;
 
+	/*
+	 * Include the checkpoint transaction, if one is running: we should
+	 * ignore any uncommitted changes the checkpoint has written to the
+	 * metadata.  We don't have to keep the checkpoint's changes pinned so
+	 * don't including it in the published snap_min.
+	 */
+	if ((id = txn_global->checkpoint_txnid) != WT_TXN_NONE)
+		txn->snapshot[n++] = id;
+
 	/* For pure read-only workloads, avoid scanning. */
 	if (prev_oldest_id == current_id) {
 		txn_state->snap_min = current_id;
-		__txn_sort_snapshot(session, 0, current_id);
-
 		/* Check that the oldest ID has not moved in the meantime. */
 		WT_ASSERT(session, prev_oldest_id == txn_global->oldest_id);
-		WT_RET(__wt_readunlock(session, txn_global->scan_rwlock));
-		return (0);
+		goto done;
 	}
 
 	/* Walk the array of concurrent transactions. */
 	WT_ORDERED_READ(session_cnt, conn->session_cnt);
-	for (i = n = 0, s = txn_global->states; i < session_cnt; i++, s++) {
+	for (i = 0, s = txn_global->states; i < session_cnt; i++, s++) {
 		/*
 		 * Build our snapshot of any concurrent transaction IDs.
 		 *
@@ -178,8 +185,7 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 	WT_ASSERT(session, prev_oldest_id == txn_global->oldest_id);
 	txn_state->snap_min = snap_min;
 
-	WT_RET(__wt_readunlock(session, txn_global->scan_rwlock));
-
+done:	__wt_readunlock(session, txn_global->scan_rwlock);
 	__txn_sort_snapshot(session, n, current_id);
 	return (0);
 }
@@ -286,12 +292,12 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 
 	/* First do a read-only scan. */
 	if (wait)
-		WT_RET(__wt_readlock(session, txn_global->scan_rwlock));
+		__wt_readlock(session, txn_global->scan_rwlock);
 	else if ((ret =
 	    __wt_try_readlock(session, txn_global->scan_rwlock)) != 0)
 		return (ret == EBUSY ? 0 : ret);
 	__txn_oldest_scan(session, &oldest_id, &last_running, &oldest_session);
-	WT_RET(__wt_readunlock(session, txn_global->scan_rwlock));
+	__wt_readunlock(session, txn_global->scan_rwlock);
 
 	/*
 	 * If the state hasn't changed (or hasn't moved far enough for
@@ -305,7 +311,7 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 
 	/* It looks like an update is necessary, wait for exclusive access. */
 	if (wait)
-		WT_RET(__wt_writelock(session, txn_global->scan_rwlock));
+		__wt_writelock(session, txn_global->scan_rwlock);
 	else if ((ret =
 	    __wt_try_writelock(session, txn_global->scan_rwlock)) != 0)
 		return (ret == EBUSY ? 0 : ret);
@@ -346,21 +352,23 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 	if (WT_TXNID_LT(txn_global->last_running, last_running)) {
 		txn_global->last_running = last_running;
 
+#ifdef HAVE_VERBOSE
 		/* Output a verbose message about long-running transactions,
 		 * but only when some progress is being made. */
 		if (WT_VERBOSE_ISSET(session, WT_VERB_TRANSACTION) &&
 		    current_id - oldest_id > 10000 && oldest_session != NULL) {
-			WT_TRET(__wt_verbose(session, WT_VERB_TRANSACTION,
+			__wt_verbose(session, WT_VERB_TRANSACTION,
 			    "old snapshot %" PRIu64
 			    " pinned in session %" PRIu32 " [%s]"
 			    " with snap_min %" PRIu64 "\n",
 			    oldest_id, oldest_session->id,
 			    oldest_session->lastop,
-			    oldest_session->txn.snap_min));
+			    oldest_session->txn.snap_min);
 		}
+#endif
 	}
 
-done:	WT_TRET(__wt_writeunlock(session, txn_global->scan_rwlock));
+done:	__wt_writeunlock(session, txn_global->scan_rwlock);
 	return (ret);
 }
 
@@ -431,18 +439,22 @@ __wt_txn_release(WT_SESSION_IMPL *session)
 	WT_TXN_STATE *txn_state;
 
 	txn = &session->txn;
-	WT_ASSERT(session, txn->mod_count == 0);
-	txn->notify = NULL;
-
 	txn_global = &S2C(session)->txn_global;
 	txn_state = WT_SESSION_TXN_STATE(session);
+
+	WT_ASSERT(session, txn->mod_count == 0);
+	txn->notify = NULL;
 
 	/* Clear the transaction's ID from the global table. */
 	if (WT_SESSION_IS_CHECKPOINT(session)) {
 		WT_ASSERT(session, txn_state->id == WT_TXN_NONE);
-		txn->id = WT_TXN_NONE;
+		txn->id = txn_global->checkpoint_txnid = WT_TXN_NONE;
 
-		/* Clear the global checkpoint transaction IDs. */
+		/*
+		 * Be extra careful to cleanup everything for checkpoints: once
+		 * the global checkpoint ID is cleared, we can no longer tell
+		 * if this session is doing a checkpoint.
+		 */
 		txn_global->checkpoint_id = 0;
 		txn_global->checkpoint_pinned = WT_TXN_NONE;
 	} else if (F_ISSET(txn, WT_TXN_HAS_ID)) {
@@ -468,6 +480,7 @@ __wt_txn_release(WT_SESSION_IMPL *session)
 	 */
 	__wt_txn_release_snapshot(session);
 	txn->isolation = session->isolation;
+
 	/* Ensure the transaction flags are cleared on exit */
 	txn->flags = 0;
 }
@@ -485,10 +498,12 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_TXN *txn;
 	WT_TXN_OP *op;
 	u_int i;
+	bool did_update;
 
 	txn = &session->txn;
 	conn = S2C(session);
-	WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR) || txn->mod_count == 0);
+	did_update = txn->mod_count != 0;
+	WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR) || !did_update);
 
 	if (!F_ISSET(txn, WT_TXN_RUNNING))
 		WT_RET_MSG(session, EINVAL, "No transaction is active");
@@ -522,7 +537,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 		 */
 		if (F_ISSET(txn, WT_TXN_SYNC_SET))
 			WT_RET_MSG(session, EINVAL,
-			    "Sync already set during begin_transaction.");
+			    "Sync already set during begin_transaction");
 		if (WT_STRING_MATCH("background", cval.str, cval.len))
 			txn->txn_logsync = WT_LOG_BACKGROUND;
 		else if (WT_STRING_MATCH("off", cval.str, cval.len))
@@ -538,8 +553,18 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 		WT_TRET(txn->notify->notify(txn->notify,
 		    (WT_SESSION *)session, txn->id, 1));
 
+	/*
+	 * We are about to release the snapshot: copy values into any
+	 * positioned cursors so they don't point to updates that could be
+	 * freed once we don't have a snapshot.
+	 */
+	if (session->ncursors > 0) {
+		WT_DIAGNOSTIC_YIELD;
+		WT_RET(__wt_session_copy_values(session));
+	}
+
 	/* If we are logging, write a commit log record. */
-	if (ret == 0 && txn->mod_count > 0 &&
+	if (ret == 0 && did_update &&
 	    FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED) &&
 	    !F_ISSET(session, WT_SESSION_NO_LOGGING)) {
 		/*
@@ -566,14 +591,6 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	for (i = 0, op = txn->mod; i < txn->mod_count; i++, op++)
 		__wt_txn_op_free(session, op);
 	txn->mod_count = 0;
-
-	/*
-	 * We are about to release the snapshot: copy values into any
-	 * positioned cursors so they don't point to updates that could be
-	 * freed once we don't have a transaction ID pinned.
-	 */
-	if (session->ncursors > 0)
-		WT_RET(__wt_session_copy_values(session));
 
 	__wt_txn_release(session);
 	return (0);
@@ -765,23 +782,20 @@ __wt_txn_global_init(WT_SESSION_IMPL *session, const char *cfg[])
  * __wt_txn_global_destroy --
  *	Destroy the global transaction state.
  */
-int
+void
 __wt_txn_global_destroy(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
 	WT_TXN_GLOBAL *txn_global;
 
 	conn = S2C(session);
 	txn_global = &conn->txn_global;
 
 	if (txn_global == NULL)
-		return (0);
+		return;
 
 	__wt_spin_destroy(session, &txn_global->id_lock);
-	WT_TRET(__wt_rwlock_destroy(session, &txn_global->scan_rwlock));
-	WT_TRET(__wt_rwlock_destroy(session, &txn_global->nsnap_rwlock));
+	__wt_rwlock_destroy(session, &txn_global->scan_rwlock);
+	__wt_rwlock_destroy(session, &txn_global->nsnap_rwlock);
 	__wt_free(session, txn_global->states);
-
-	return (ret);
 }

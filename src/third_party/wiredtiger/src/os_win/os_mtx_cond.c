@@ -18,10 +18,6 @@ __wt_cond_alloc(WT_SESSION_IMPL *session,
 {
 	WT_CONDVAR *cond;
 
-	/*
-	 * !!!
-	 * This function MUST handle a NULL session handle.
-	 */
 	WT_RET(__wt_calloc_one(session, &cond));
 
 	InitializeCriticalSection(&cond->mtx);
@@ -38,34 +34,27 @@ __wt_cond_alloc(WT_SESSION_IMPL *session,
 
 /*
  * __wt_cond_wait_signal --
- *	Wait on a mutex, optionally timing out.  If we get it
- *	before the time out period expires, let the caller know.
+ *	Wait on a mutex, optionally timing out.  If we get it before the time
+ * out period expires, let the caller know.
  */
-int
+void
 __wt_cond_wait_signal(
     WT_SESSION_IMPL *session, WT_CONDVAR *cond, uint64_t usecs, bool *signalled)
 {
-	DWORD err, milliseconds;
-	WT_DECL_RET;
-	uint64_t milliseconds64;
+	BOOL sleepret;
+	DWORD milliseconds, windows_error;
 	bool locked;
+	uint64_t milliseconds64;
 
 	locked = false;
 
 	/* Fast path if already signalled. */
 	*signalled = true;
 	if (__wt_atomic_addi32(&cond->waiters, 1) == 0)
-		return (0);
+		return;
 
-	/*
-	 * !!!
-	 * This function MUST handle a NULL session handle.
-	 */
-	if (session != NULL) {
-		WT_RET(__wt_verbose(session, WT_VERB_MUTEX,
-			"wait %s cond (%p)", cond->name, cond));
-		WT_STAT_FAST_CONN_INCR(session, cond_wait);
-	}
+	__wt_verbose(session, WT_VERB_MUTEX, "wait %s", cond->name);
+	WT_STAT_CONN_INCR(session, cond_wait);
 
 	EnterCriticalSection(&cond->mtx);
 	locked = true;
@@ -88,40 +77,43 @@ __wt_cond_wait_signal(
 		if (milliseconds == 0)
 			milliseconds = 1;
 
-		ret = SleepConditionVariableCS(
+		sleepret = SleepConditionVariableCS(
 		    &cond->cond, &cond->mtx, milliseconds);
 	} else
-		ret = SleepConditionVariableCS(
+		sleepret = SleepConditionVariableCS(
 		    &cond->cond, &cond->mtx, INFINITE);
 
 	/*
 	 * SleepConditionVariableCS returns non-zero on success, 0 on timeout
-	 * or failure. Check for timeout, else convert to a WiredTiger error
-	 * value and fail.
+	 * or failure.
 	 */
-	if (ret == 0) {
-		if ((err = GetLastError()) == ERROR_TIMEOUT)
+	if (sleepret == 0) {
+		windows_error = __wt_getlasterror();
+		if (windows_error == ERROR_TIMEOUT) {
 			*signalled = false;
-		else
-			ret = __wt_getlasterror();
-	} else
-		ret = 0;
+			sleepret = 1;
+		}
+	}
 
 	(void)__wt_atomic_subi32(&cond->waiters, 1);
 
 	if (locked)
 		LeaveCriticalSection(&cond->mtx);
 
-	if (ret == 0)
-		return (0);
-	WT_RET_MSG(session, ret, "SleepConditionVariableCS");
+	if (sleepret != 0)
+		return;
+
+	__wt_errx(session, "SleepConditionVariableCS: %s: %s",
+	    cond->name, __wt_formatmessage(session, windows_error));
+	WT_PANIC_MSG(session, __wt_map_windows_error(windows_error),
+	    "SleepConditionVariableCS: %s", cond->name);
 }
 
 /*
  * __wt_cond_signal --
  *	Signal a waiting thread.
  */
-int
+void
 __wt_cond_signal(WT_SESSION_IMPL *session, WT_CONDVAR *cond)
 {
 	WT_DECL_RET;
@@ -129,17 +121,11 @@ __wt_cond_signal(WT_SESSION_IMPL *session, WT_CONDVAR *cond)
 
 	locked = false;
 
-	/*
-	 * !!!
-	 * This function MUST handle a NULL session handle.
-	 */
-	if (session != NULL)
-		WT_RET(__wt_verbose(session, WT_VERB_MUTEX,
-			"signal %s cond (%p)", cond->name, cond));
+	__wt_verbose(session, WT_VERB_MUTEX, "signal %s", cond->name);
 
 	/* Fast path if already signalled. */
 	if (cond->waiters == -1)
-		return (0);
+		return;
 
 	if (cond->waiters > 0 || !__wt_atomic_casi32(&cond->waiters, 0, -1)) {
 		EnterCriticalSection(&cond->mtx);
@@ -150,8 +136,9 @@ __wt_cond_signal(WT_SESSION_IMPL *session, WT_CONDVAR *cond)
 	if (locked)
 		LeaveCriticalSection(&cond->mtx);
 	if (ret == 0)
-		return (0);
-	WT_RET_MSG(session, ret, "WakeAllConditionVariable");
+		return;
+
+	WT_PANIC_MSG(session, ret, "WakeAllConditionVariable: %s", cond->name);
 }
 
 /*

@@ -138,7 +138,7 @@ __wt_connection_destroy(WT_CONNECTION_IMPL *conn)
 	__wt_spin_destroy(session, &conn->dhandle_lock);
 	__wt_spin_destroy(session, &conn->encryptor_lock);
 	__wt_spin_destroy(session, &conn->fh_lock);
-	WT_TRET(__wt_rwlock_destroy(session, &conn->hot_backup_lock));
+	__wt_rwlock_destroy(session, &conn->hot_backup_lock);
 	__wt_spin_destroy(session, &conn->las_lock);
 	__wt_spin_destroy(session, &conn->metadata_lock);
 	__wt_spin_destroy(session, &conn->reconfig_lock);
@@ -149,14 +149,16 @@ __wt_connection_destroy(WT_CONNECTION_IMPL *conn)
 		__wt_spin_destroy(session, &conn->page_lock[i]);
 	__wt_free(session, conn->page_lock);
 
+	/* Destroy the file-system configuration. */
+	if (conn->file_system != NULL && conn->file_system->terminate != NULL)
+		WT_TRET(conn->file_system->terminate(
+		    conn->file_system, (WT_SESSION *)session));
+
 	/* Free allocated memory. */
 	__wt_free(session, conn->cfg);
 	__wt_free(session, conn->home);
 	__wt_free(session, conn->error_prefix);
 	__wt_free(session, conn->sessions);
-
-	/* Destroy the OS configuration. */
-	WT_TRET(__wt_os_cleanup(session));
 
 	__wt_free(NULL, conn);
 	return (ret);

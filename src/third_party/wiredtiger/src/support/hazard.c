@@ -121,7 +121,8 @@ __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 		return (0);
 	}
 
-	__wt_errx(session, "session %p: hazard pointer table full", session);
+	__wt_errx(session,
+	    "session %p: hazard pointer table full", (void *)session);
 #ifdef HAVE_DIAGNOSTIC
 	__hazard_dump(session);
 #endif
@@ -165,9 +166,10 @@ __wt_hazard_clear(WT_SESSION_IMPL *session, WT_PAGE *page)
 
 			/*
 			 * If this was the last hazard pointer in the session,
-			 * we may need to update our transactional context.
+			 * reset the size so that checks can skip this session.
 			 */
-			--session->nhazard;
+			if (--session->nhazard == 0)
+				WT_PUBLISH(session->hazard_size, 0);
 			return (0);
 		}
 
@@ -176,7 +178,8 @@ __wt_hazard_clear(WT_SESSION_IMPL *session, WT_PAGE *page)
 	 * because using a page we didn't have pinned down implies corruption.
 	 */
 	WT_PANIC_RET(session, EINVAL,
-	    "session %p: clear hazard pointer: %p: not found", session, page);
+	    "session %p: clear hazard pointer: %p: not found",
+	    (void *)session, (void *)page);
 }
 
 /*
@@ -204,7 +207,8 @@ __wt_hazard_close(WT_SESSION_IMPL *session)
 		return;
 
 	__wt_errx(session,
-	    "session %p: close hazard pointer table: table not empty", session);
+	    "session %p: close hazard pointer table: table not empty",
+	    (void *)session);
 
 #ifdef HAVE_DIAGNOSTIC
 	__hazard_dump(session);
@@ -232,7 +236,26 @@ __wt_hazard_close(WT_SESSION_IMPL *session)
 		__wt_errx(session,
 		    "session %p: close hazard pointer table: count didn't "
 		    "match entries",
-		    session);
+		    (void *)session);
+}
+
+/*
+ * __wt_hazard_count --
+ *	Count how many hazard pointers this session has on the given page.
+ */
+u_int
+__wt_hazard_count(WT_SESSION_IMPL *session, WT_PAGE *page)
+{
+	WT_HAZARD *hp;
+	u_int count;
+
+	for (count = 0, hp = session->hazard + session->hazard_size - 1;
+	    hp >= session->hazard;
+	    --hp)
+		if (hp->page == page)
+			++count;
+
+	return (count);
 }
 
 #ifdef HAVE_DIAGNOSTIC
@@ -250,6 +273,7 @@ __hazard_dump(WT_SESSION_IMPL *session)
 		if (hp->page != NULL)
 			__wt_errx(session,
 			    "session %p: hazard pointer %p: %s, line %d",
-			    session, hp->page, hp->file, hp->line);
+			    (void *)session,
+			    (void *)hp->page, hp->file, hp->line);
 }
 #endif

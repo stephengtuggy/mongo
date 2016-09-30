@@ -35,7 +35,7 @@ __wt_direct_io_size_check(WT_SESSION_IMPL *session,
 	 * units of its happy place.
 	 */
 	if (FLD_ISSET(conn->direct_io,
-	   WT_FILE_TYPE_CHECKPOINT | WT_FILE_TYPE_DATA)) {
+	   WT_DIRECT_IO_CHECKPOINT | WT_DIRECT_IO_DATA)) {
 		align = (int64_t)conn->buffer_alignment;
 		if (align != 0 && (cval.val < align || cval.val % align != 0))
 			WT_RET_MSG(session, EINVAL,
@@ -446,7 +446,7 @@ __create_index(WT_SESSION_IMPL *session,
 	 */
 	npublic_cols = 0;
 	if (!have_extractor) {
-		WT_ERR(__wt_config_subinit(session, &kcols, &icols));
+		__wt_config_subinit(session, &kcols, &icols);
 		while ((ret = __wt_config_next(&kcols, &ckey, &cval)) == 0)
 			++npublic_cols;
 		WT_ERR_NOTFOUND_OK(ret);
@@ -465,7 +465,7 @@ __create_index(WT_SESSION_IMPL *session,
 	 * key_format, which we are calculating now, but not part of an index
 	 * cursor's key_format.
 	 */
-	WT_ERR(__wt_config_subinit(session, &pkcols, &table->colconf));
+	__wt_config_subinit(session, &pkcols, &table->colconf);
 	for (i = 0; i < table->nkey_columns &&
 	    (ret = __wt_config_next(&pkcols, &ckey, &cval)) == 0;
 	    i++) {
@@ -578,10 +578,10 @@ __create_table(WT_SESSION_IMPL *session,
 			WT_ERR(EEXIST);
 		exists = true;
 	}
-	WT_RET_NOTFOUND_OK(ret);
+	WT_ERR_NOTFOUND_OK(ret);
 
 	WT_ERR(__wt_config_gets(session, cfg, "colgroups", &cval));
-	WT_ERR(__wt_config_subinit(session, &conf, &cval));
+	__wt_config_subinit(session, &conf, &cval);
 	for (ncolgroups = 0;
 	    (ret = __wt_config_next(&conf, &cgkey, &cgval)) == 0;
 	    ncolgroups++)

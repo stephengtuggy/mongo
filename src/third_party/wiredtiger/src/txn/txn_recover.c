@@ -60,9 +60,9 @@ __recovery_cursor(WT_SESSION_IMPL *session, WT_RECOVERY *r,
 	else if (id >= r->nfiles || r->files[id].uri == NULL) {
 		/* If a file is missing, output a verbose message once. */
 		if (!r->missing)
-			WT_RET(__wt_verbose(session, WT_VERB_RECOVERY,
+			__wt_verbose(session, WT_VERB_RECOVERY,
 			    "No file found with ID %u (max %u)",
-			    id, r->nfiles));
+			    id, r->nfiles);
 		r->missing = true;
 	} else if (__wt_log_cmp(lsnp, &r->files[id].ckpt_lsn) >= 0) {
 		/*
@@ -89,11 +89,11 @@ __recovery_cursor(WT_SESSION_IMPL *session, WT_RECOVERY *r,
  */
 #define	GET_RECOVERY_CURSOR(session, r, lsnp, fileid, cp)		\
 	WT_ERR(__recovery_cursor(session, r, lsnp, fileid, false, cp));	\
-	WT_ERR(__wt_verbose(session, WT_VERB_RECOVERY,			\
+	__wt_verbose(session, WT_VERB_RECOVERY,				\
 	    "%s op %" PRIu32 " to file %" PRIu32 " at LSN %" PRIu32	\
 	    "/%" PRIu32,						\
 	    cursor == NULL ? "Skipping" : "Applying",			\
-	    optype, fileid, lsnp->l.file, lsnp->l.offset));		\
+	    optype, fileid, lsnp->l.file, lsnp->l.offset);		\
 	if (cursor == NULL)						\
 		break
 
@@ -333,9 +333,9 @@ __recovery_setup_file(WT_RECOVERY *r, const char *uri, const char *config)
 		    (int)cval.len, cval.str);
 	r->files[fileid].ckpt_lsn = lsn;
 
-	WT_RET(__wt_verbose(r->session, WT_VERB_RECOVERY,
+	__wt_verbose(r->session, WT_VERB_RECOVERY,
 	    "Recovering %s with id %" PRIu32 " @ (%" PRIu32 ", %" PRIu32 ")",
-	    uri, fileid, lsn.l.file, lsn.l.offset));
+	    uri, fileid, lsn.l.file, lsn.l.offset);
 
 	return (0);
 
@@ -424,6 +424,7 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 	    false, WT_SESSION_NO_LOGGING, &session));
 	r.session = session;
 
+	F_SET(conn, WT_CONN_RECOVERING);
 	WT_ERR(__wt_metadata_search(session, WT_METAFILE_URI, &config));
 	WT_ERR(__recovery_setup_file(&r, WT_METAFILE_URI, config));
 	WT_ERR(__wt_metadata_cursor_open(session, NULL, &metac));
@@ -495,9 +496,9 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 	 * Pass WT_LOGSCAN_RECOVER so that old logs get truncated.
 	 */
 	r.metadata_only = false;
-	WT_ERR(__wt_verbose(session, WT_VERB_RECOVERY,
+	__wt_verbose(session, WT_VERB_RECOVERY,
 	    "Main recovery loop: starting at %" PRIu32 "/%" PRIu32,
-	    r.ckpt_lsn.l.file, r.ckpt_lsn.l.offset));
+	    r.ckpt_lsn.l.file, r.ckpt_lsn.l.offset);
 	WT_ERR(__wt_log_needs_recovery(session, &r.ckpt_lsn, &needs_rec));
 	/*
 	 * Check if the database was shut down cleanly.  If not
@@ -566,6 +567,7 @@ err:	WT_TRET(__recovery_free(&r));
 		WT_TRET(__wt_evict_destroy(session));
 
 	WT_TRET(session->iface.close(&session->iface, NULL));
+	F_CLR(conn, WT_CONN_RECOVERING);
 
 	return (ret);
 }

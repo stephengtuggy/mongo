@@ -33,6 +33,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Berkeley DB has an #ifdef we need to provide a value for, we'll see an
+ * undefined error if it's unset during a strict compile.
+ */
+#ifndef	DB_DBM_HSEARCH
+#define	DB_DBM_HSEARCH	0
+#endif
 #include <db.h>
 #include <wiredtiger.h>
 #include <wiredtiger_ext.h>
@@ -831,7 +838,7 @@ kvs_session_open_cursor(WT_DATA_SOURCE *wtds, WT_SESSION *session,
 		goto err;
 	}
 	cursor->config_bitfield =
-	    v.len == 2 && isdigit(v.str[0]) && v.str[1] == 't';
+	    v.len == 2 && isdigit((u_char)v.str[0]) && v.str[1] == 't';
 
 	if ((ret = writelock(wtext, session, &ds->rwlock)) != 0)
 		goto err;

@@ -120,6 +120,8 @@ DEF_OPT_AS_BOOL(insert_rmw, 0,
     "execute a read prior to each insert in workload phase")
 DEF_OPT_AS_UINT32(key_sz, 20, "key size")
 DEF_OPT_AS_BOOL(log_partial, 0, "perform partial logging on first table only.")
+DEF_OPT_AS_BOOL(log_like_table, 0,
+    "Append all modification operations to another shared table.")
 DEF_OPT_AS_UINT32(min_throughput, 0,
     "notify if any throughput measured is less than this amount. "
     "Aborts or prints warning based on min_throughput_fatal setting. "
@@ -144,6 +146,7 @@ DEF_OPT_AS_UINT32(random_range, 0,
     "if non zero choose a value from within this range as the key for "
     "insert operations")
 DEF_OPT_AS_BOOL(random_value, 0, "generate random content for the value")
+DEF_OPT_AS_BOOL(range_partition, 0, "partition data by range (vs hash)")
 DEF_OPT_AS_UINT32(read_range, 0, "scan a range of keys after each search")
 DEF_OPT_AS_BOOL(readonly, 0,
     "reopen the connection between populate and workload phases in readonly "
@@ -163,6 +166,8 @@ DEF_OPT_AS_UINT32(sample_rate, 50,
     "how often the latency of operations is measured. One for every operation,"
     "two for every second operation, three for every third operation etc.")
 DEF_OPT_AS_CONFIG_STRING(sess_config, "", "session configuration string")
+DEF_OPT_AS_UINT32(session_count_idle, 0,
+    "number of idle sessions to create. Default 0.")
 DEF_OPT_AS_CONFIG_STRING(table_config,
     "key_format=S,value_format=S,type=lsm,exclusive=true,"
     "allocation_size=4kb,internal_page_max=64kb,leaf_page_max=4kb,"
@@ -191,6 +196,8 @@ DEF_OPT_AS_CONFIG_STRING(transaction_config, "",
     "transaction configuration string, relevant when populate_opts_per_txn "
     "is nonzero")
 DEF_OPT_AS_STRING(table_name, "test", "table name")
+DEF_OPT_AS_BOOL(truncate_single_ops, 0,
+    "Implement truncate via cursor remove instead of session API")
 DEF_OPT_AS_UINT32(value_sz_max, 1000,
     "maximum value size when delta updates are present. Default disabled")
 DEF_OPT_AS_UINT32(value_sz_min, 1,

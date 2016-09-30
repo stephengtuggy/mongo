@@ -40,7 +40,7 @@ __wt_clsm_request_switch(WT_CURSOR_LSM *clsm)
 		 * to switching multiple times when only one switch is
 		 * required, creating very small chunks.
 		 */
-		WT_RET(__wt_lsm_tree_readlock(session, lsm_tree));
+		__wt_lsm_tree_readlock(session, lsm_tree);
 		if (lsm_tree->nchunks == 0 ||
 		    (clsm->dsk_gen == lsm_tree->dsk_gen &&
 		    !F_ISSET(lsm_tree, WT_LSM_TREE_NEED_SWITCH))) {
@@ -48,7 +48,7 @@ __wt_clsm_request_switch(WT_CURSOR_LSM *clsm)
 			ret = __wt_lsm_manager_push_entry(
 			    session, WT_LSM_WORK_SWITCH, 0, lsm_tree);
 		}
-		WT_TRET(__wt_lsm_tree_readunlock(session, lsm_tree));
+		__wt_lsm_tree_readunlock(session, lsm_tree);
 	}
 
 	return (ret);
@@ -103,7 +103,6 @@ __clsm_enter_update(WT_CURSOR_LSM *clsm)
 	bool hard_limit, have_primary, ovfl;
 
 	lsm_tree = clsm->lsm_tree;
-	ovfl = false;
 	session = (WT_SESSION_IMPL *)clsm->iface.session;
 
 	if (clsm->nchunks == 0) {
@@ -206,6 +205,12 @@ __clsm_enter(WT_CURSOR_LSM *clsm, bool reset, bool update)
 			WT_RET(__wt_txn_id_check(session));
 
 			WT_RET(__clsm_enter_update(clsm));
+			/*
+			 * Switching the tree will update the generation before
+			 * updating the switch transaction.  We test the
+			 * transaction in clsm_enter_update.  Now test the
+			 * disk generation to avoid races.
+			 */
 			if (clsm->dsk_gen != clsm->lsm_tree->dsk_gen)
 				goto open;
 
@@ -220,13 +225,20 @@ __clsm_enter(WT_CURSOR_LSM *clsm, bool reset, bool update)
 			 * transaction ID in each chunk: any transaction ID
 			 * that overlaps with our snapshot is a potential
 			 * conflict.
+			 *
+			 * Note that the global snap_min is correct here: it
+			 * tracks concurrent transactions excluding special
+			 * transactions such as checkpoint (which we can't
+			 * conflict with because checkpoint only writes the
+			 * metadata, which is not an LSM tree).
 			 */
 			clsm->nupdates = 1;
 			if (txn->isolation == WT_ISO_SNAPSHOT &&
 			    F_ISSET(clsm, WT_CLSM_OPEN_SNAPSHOT)) {
 				WT_ASSERT(session,
 				    F_ISSET(txn, WT_TXN_HAS_SNAPSHOT));
-				snap_min = txn->snap_min;
+				snap_min =
+				    WT_SESSION_TXN_STATE(session)->snap_min;
 				for (switch_txnp =
 				    &clsm->switch_txn[clsm->nchunks - 2];
 				    clsm->nupdates < clsm->nchunks;
@@ -446,7 +458,7 @@ __clsm_open_cursors(
 
 	F_CLR(clsm, WT_CLSM_ITERATE_NEXT | WT_CLSM_ITERATE_PREV);
 
-	WT_RET(__wt_lsm_tree_readlock(session, lsm_tree));
+	__wt_lsm_tree_readlock(session, lsm_tree);
 	locked = true;
 
 	/* Merge cursors have already figured out how many chunks they need. */
@@ -565,10 +577,10 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 		if (close_range_end > close_range_start) {
 			saved_gen = lsm_tree->dsk_gen;
 			locked = false;
-			WT_ERR(__wt_lsm_tree_readunlock(session, lsm_tree));
+			__wt_lsm_tree_readunlock(session, lsm_tree);
 			WT_ERR(__clsm_close_cursors(
 			    clsm, close_range_start, close_range_end));
-			WT_ERR(__wt_lsm_tree_readlock(session, lsm_tree));
+			__wt_lsm_tree_readlock(session, lsm_tree);
 			locked = true;
 			if (lsm_tree->dsk_gen != saved_gen)
 				goto retry;
@@ -656,7 +668,7 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 
 	clsm->dsk_gen = lsm_tree->dsk_gen;
 
-err:	
+err:
 #ifdef HAVE_DIAGNOSTIC
 	/* Check that all cursors are open as expected. */
 	if (ret == 0 && F_ISSET(clsm, WT_CLSM_OPEN_READ)) {
@@ -686,7 +698,7 @@ err:
 	}
 #endif
 	if (locked)
-		WT_TRET(__wt_lsm_tree_readunlock(session, lsm_tree));
+		__wt_lsm_tree_readunlock(session, lsm_tree);
 	return (ret);
 }
 
@@ -1062,8 +1074,7 @@ __clsm_lookup(WT_CURSOR_LSM *clsm, WT_ITEM *value)
 		bloom = NULL;
 		if ((bloom = clsm->blooms[i]) != NULL) {
 			if (!have_hash) {
-				WT_ERR(__wt_bloom_hash(
-				    bloom, &cursor->key, &bhash));
+				__wt_bloom_hash(bloom, &cursor->key, &bhash);
 				have_hash = true;
 			}
 
@@ -1155,7 +1166,6 @@ __clsm_search_near(WT_CURSOR *cursor, int *exactp)
 	closest = NULL;
 	clsm = (WT_CURSOR_LSM *)cursor;
 	exact = 0;
-	deleted = false;
 
 	CURSOR_API_CALL(cursor, session, search_near, NULL);
 	WT_CURSOR_NEEDKEY(cursor);
@@ -1338,11 +1348,11 @@ __clsm_put(WT_SESSION_IMPL *session, WT_CURSOR_LSM *clsm,
 		clsm->update_count = 0;
 		WT_LSM_TREE_STAT_INCRV(session,
 		    lsm_tree->lsm_checkpoint_throttle, lsm_tree->ckpt_throttle);
-		WT_STAT_FAST_CONN_INCRV(session,
+		WT_STAT_CONN_INCRV(session,
 		    lsm_checkpoint_throttle, lsm_tree->ckpt_throttle);
 		WT_LSM_TREE_STAT_INCRV(session,
 		    lsm_tree->lsm_merge_throttle, lsm_tree->merge_throttle);
-		WT_STAT_FAST_CONN_INCRV(session,
+		WT_STAT_CONN_INCRV(session,
 		    lsm_merge_throttle, lsm_tree->merge_throttle);
 		__wt_sleep(0,
 		    lsm_tree->ckpt_throttle + lsm_tree->merge_throttle);
@@ -1523,6 +1533,8 @@ __wt_clsm_open(WT_SESSION_IMPL *session,
 	WT_LSM_TREE *lsm_tree;
 	bool bulk;
 
+	WT_STATIC_ASSERT(offsetof(WT_CURSOR_LSM, iface) == 0);
+
 	clsm = NULL;
 	cursor = NULL;
 	lsm_tree = NULL;
@@ -1568,6 +1580,7 @@ __wt_clsm_open(WT_SESSION_IMPL *session,
 	cursor->value_format = lsm_tree->value_format;
 
 	clsm->lsm_tree = lsm_tree;
+	lsm_tree = NULL;
 
 	/*
 	 * The tree's dsk_gen starts at one, so starting the cursor on zero
@@ -1575,7 +1588,6 @@ __wt_clsm_open(WT_SESSION_IMPL *session,
 	 */
 	clsm->dsk_gen = 0;
 
-	WT_STATIC_ASSERT(offsetof(WT_CURSOR_LSM, iface) == 0);
 	WT_ERR(__wt_cursor_init(cursor, cursor->uri, owner, cfg, cursorp));
 
 	if (bulk)
@@ -1587,10 +1599,6 @@ err:		if (clsm != NULL)
 		else if (lsm_tree != NULL)
 			__wt_lsm_tree_release(session, lsm_tree);
 
-		/*
-		 * We open bulk cursors after setting the returned cursor.
-		 * Fix that here.
-		 */
 		*cursorp = NULL;
 	}
 

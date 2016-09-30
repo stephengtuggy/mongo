@@ -19,61 +19,49 @@ __ckpt_server_config(WT_SESSION_IMPL *session, const char **cfg, bool *startp)
 {
 	WT_CONFIG_ITEM cval;
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_ITEM(tmp);
-	WT_DECL_RET;
-	char *p;
+
+	*startp = false;
+
+	*startp = false;
 
 	conn = S2C(session);
 
-	/*
-	 * The checkpoint configuration requires a wait time and/or a log
-	 * size -- if one is not set, we're not running at all.
-	 * Checkpoints based on log size also require logging be enabled.
-	 */
 	WT_RET(__wt_config_gets(session, cfg, "checkpoint.wait", &cval));
 	conn->ckpt_usecs = (uint64_t)cval.val * WT_MILLION;
 
 	WT_RET(__wt_config_gets(session, cfg, "checkpoint.log_size", &cval));
 	conn->ckpt_logsize = (wt_off_t)cval.val;
 
-	/* Checkpoints are incompatible with in-memory configuration */
-	if (conn->ckpt_usecs != 0 || conn->ckpt_logsize != 0) {
+	/*
+	 * The checkpoint configuration requires a wait time and/or a log size,
+	 * if neither is set, we're not running at all. Checkpoints based on log
+	 * size also require logging be enabled.
+	 */
+	if (conn->ckpt_usecs != 0 ||
+	    (conn->ckpt_logsize != 0 &&
+	    FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))) {
+		/*
+		 * If checkpointing based on log data, use a minimum of the
+		 * log file size.  The logging subsystem has already been
+		 * initialized.
+		 */
+		if (conn->ckpt_logsize != 0 &&
+		    FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
+			conn->ckpt_logsize = WT_MAX(
+			    conn->ckpt_logsize, conn->log_file_max);
+		/* Checkpoints are incompatible with in-memory configuration */
 		WT_RET(__wt_config_gets(session, cfg, "in_memory", &cval));
 		if (cval.val != 0)
 			WT_RET_MSG(session, EINVAL,
-			    "In memory configuration incompatible with "
-			    "checkpoints");
+			    "checkpoint configuration incompatible with "
+			    "in-memory configuration");
+
+		__wt_log_written_reset(session);
+
+		*startp = true;
 	}
 
-	__wt_log_written_reset(session);
-	if ((conn->ckpt_usecs == 0 && conn->ckpt_logsize == 0) ||
-	    (conn->ckpt_logsize && conn->ckpt_usecs == 0 &&
-	     !FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))) {
-		*startp = false;
-		return (0);
-	}
-	*startp = true;
-
-	/*
-	 * The application can specify a checkpoint name, which we ignore if
-	 * it's our default.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "checkpoint.name", &cval));
-	if (cval.len != 0 &&
-	    !WT_STRING_MATCH(WT_CHECKPOINT, cval.str, cval.len)) {
-		WT_RET(__wt_checkpoint_name_ok(session, cval.str, cval.len));
-
-		WT_RET(__wt_scr_alloc(session, cval.len + 20, &tmp));
-		WT_ERR(__wt_buf_fmt(
-		    session, tmp, "name=%.*s", (int)cval.len, cval.str));
-		WT_ERR(__wt_strdup(session, tmp->data, &p));
-
-		__wt_free(session, conn->ckpt_config);
-		conn->ckpt_config = p;
-	}
-
-err:	__wt_scr_free(session, &tmp);
-	return (ret);
+	return (0);
 }
 
 /*
@@ -99,16 +87,15 @@ __ckpt_server(void *arg)
 		 * NOTE: If the user only configured logsize, then usecs
 		 * will be 0 and this wait won't return until signalled.
 		 */
-		WT_ERR(
-		    __wt_cond_wait(session, conn->ckpt_cond, conn->ckpt_usecs));
+		__wt_cond_wait(session, conn->ckpt_cond, conn->ckpt_usecs);
 
 		/* Checkpoint the database. */
-		WT_ERR(wt_session->checkpoint(wt_session, conn->ckpt_config));
+		WT_ERR(wt_session->checkpoint(wt_session, NULL));
 
 		/* Reset. */
 		if (conn->ckpt_logsize) {
 			__wt_log_written_reset(session);
-			conn->ckpt_signalled = 0;
+			conn->ckpt_signalled = false;
 
 			/*
 			 * In case we crossed the log limit during the
@@ -116,7 +103,7 @@ __ckpt_server(void *arg)
 			 * signalled, do a tiny wait to clear it so we don't do
 			 * another checkpoint immediately.
 			 */
-			WT_ERR(__wt_cond_wait(session, conn->ckpt_cond, 1));
+			__wt_cond_wait(session, conn->ckpt_cond, 1);
 		}
 	}
 
@@ -179,7 +166,16 @@ __wt_checkpoint_server_create(WT_SESSION_IMPL *session, const char *cfg[])
 	conn = S2C(session);
 	start = false;
 
-	/* If there is already a server running, shut it down. */
+	/*
+	 * Stop any server that is already running. This means that each time
+	 * reconfigure is called we'll bounce the server even if there are no
+	 * configuration changes. This makes our life easier as the underlying
+	 * configuration routine doesn't have to worry about freeing objects
+	 * in the connection structure (it's guaranteed to always start with a
+	 * blank slate), and we don't have to worry about races where a running
+	 * server is reading configuration information that we're updating, and
+	 * it's not expected that reconfiguration will happen a lot.
+	 */
 	if (conn->ckpt_session != NULL)
 		WT_RET(__wt_checkpoint_server_destroy(session));
 
@@ -205,13 +201,11 @@ __wt_checkpoint_server_destroy(WT_SESSION_IMPL *session)
 
 	F_CLR(conn, WT_CONN_SERVER_CHECKPOINT);
 	if (conn->ckpt_tid_set) {
-		WT_TRET(__wt_cond_signal(session, conn->ckpt_cond));
+		__wt_cond_signal(session, conn->ckpt_cond);
 		WT_TRET(__wt_thread_join(session, conn->ckpt_tid));
 		conn->ckpt_tid_set = false;
 	}
 	WT_TRET(__wt_cond_destroy(session, &conn->ckpt_cond));
-
-	__wt_free(session, conn->ckpt_config);
 
 	/* Close the server thread's session. */
 	if (conn->ckpt_session != NULL) {
@@ -226,7 +220,6 @@ __wt_checkpoint_server_destroy(WT_SESSION_IMPL *session)
 	conn->ckpt_session = NULL;
 	conn->ckpt_tid_set = false;
 	conn->ckpt_cond = NULL;
-	conn->ckpt_config = NULL;
 	conn->ckpt_usecs = 0;
 
 	return (ret);
@@ -235,9 +228,8 @@ __wt_checkpoint_server_destroy(WT_SESSION_IMPL *session)
 /*
  * __wt_checkpoint_signal --
  *	Signal the checkpoint thread if sufficient log has been written.
- *	Return 1 if this signals the checkpoint thread, 0 otherwise.
  */
-int
+void
 __wt_checkpoint_signal(WT_SESSION_IMPL *session, wt_off_t logsize)
 {
 	WT_CONNECTION_IMPL *conn;
@@ -245,8 +237,7 @@ __wt_checkpoint_signal(WT_SESSION_IMPL *session, wt_off_t logsize)
 	conn = S2C(session);
 	WT_ASSERT(session, WT_CKPT_LOGSIZE(conn));
 	if (logsize >= conn->ckpt_logsize && !conn->ckpt_signalled) {
-		WT_RET(__wt_cond_signal(session, conn->ckpt_cond));
-		conn->ckpt_signalled = 1;
+		__wt_cond_signal(session, conn->ckpt_cond);
+		conn->ckpt_signalled = true;
 	}
-	return (0);
 }

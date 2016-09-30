@@ -12,19 +12,15 @@
  * __conn_dhandle_destroy --
  *	Destroy a data handle.
  */
-static int
+static void
 __conn_dhandle_destroy(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle)
 {
-	WT_DECL_RET;
-
-	ret = __wt_rwlock_destroy(session, &dhandle->rwlock);
+	__wt_rwlock_destroy(session, &dhandle->rwlock);
 	__wt_free(session, dhandle->name);
 	__wt_free(session, dhandle->checkpoint);
 	__wt_free(session, dhandle->handle);
 	__wt_spin_destroy(session, &dhandle->close_lock);
 	__wt_overwrite_and_free(session, dhandle);
-
-	return (ret);
 }
 
 /*
@@ -39,6 +35,9 @@ __conn_dhandle_alloc(WT_SESSION_IMPL *session,
 	WT_BTREE *btree;
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
+	uint64_t bucket;
+
+	*dhandlep = NULL;
 
 	WT_RET(__wt_calloc_one(session, &dhandle));
 
@@ -57,10 +56,30 @@ __conn_dhandle_alloc(WT_SESSION_IMPL *session,
 
 	__wt_stat_dsrc_init(dhandle);
 
+	if (strcmp(uri, WT_METAFILE_URI) == 0)
+		F_SET(dhandle, WT_DHANDLE_IS_METADATA);
+
+	/*
+	 * We are holding the data handle list lock, which protects most
+	 * threads from seeing the new handle until that lock is released.
+	 *
+	 * However, the sweep server scans the list of handles without holding
+	 * that lock, so we need a write barrier here to ensure the sweep
+	 * server doesn't see a partially filled in structure.
+	 */
+	WT_WRITE_BARRIER();
+
+	/*
+	 * Prepend the handle to the connection list, assuming we're likely to
+	 * need new files again soon, until they are cached by all sessions.
+	 */
+	bucket = dhandle->name_hash % WT_HASH_ARRAY_SIZE;
+	WT_CONN_DHANDLE_INSERT(S2C(session), dhandle, bucket);
+
 	*dhandlep = dhandle;
 	return (0);
 
-err:	WT_TRET(__conn_dhandle_destroy(session, dhandle));
+err:	__conn_dhandle_destroy(session, dhandle);
 	return (ret);
 }
 
@@ -106,14 +125,6 @@ __wt_conn_dhandle_find(
 
 	WT_RET(__conn_dhandle_alloc(session, uri, checkpoint, &dhandle));
 
-	/*
-	 * Prepend the handle to the connection list, assuming we're likely to
-	 * need new files again soon, until they are cached by all sessions.
-	 * Find the right hash bucket to insert into as well.
-	 */
-	bucket = dhandle->name_hash % WT_HASH_ARRAY_SIZE;
-	WT_CONN_DHANDLE_INSERT(conn, dhandle, bucket);
-
 	session->dhandle = dhandle;
 	return (0);
 }
@@ -158,7 +169,8 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 	/*
 	 * We may not be holding the schema lock, and threads may be walking
 	 * the list of open handles (for example, checkpoint).  Acquire the
-	 * handle's close lock.
+	 * handle's close lock. We don't have the sweep server acquire the
+	 * handle's rwlock so we have to prevent races through the close code.
 	 */
 	__wt_spin_lock(session, &dhandle->close_lock);
 
@@ -476,9 +488,9 @@ __wt_conn_dhandle_close_all(
 		 * open at this point.  Close the handle, if necessary.
 		 */
 		if (F_ISSET(dhandle, WT_DHANDLE_OPEN)) {
-			if ((ret = __wt_meta_track_sub_on(session)) == 0)
-				ret = __wt_conn_btree_sync_and_close(
-				    session, false, force);
+			__wt_meta_track_sub_on(session);
+			ret = __wt_conn_btree_sync_and_close(
+			    session, false, force);
 
 			/*
 			 * If the close succeeded, drop any locks it acquired.
@@ -538,6 +550,7 @@ __wt_conn_dhandle_discard_single(
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
 	int tret;
+	bool set_pass_intr;
 
 	dhandle = session->dhandle;
 
@@ -556,12 +569,17 @@ __wt_conn_dhandle_discard_single(
 	 * Kludge: interrupt the eviction server in case it is holding the
 	 * handle list lock.
 	 */
-	if (!F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST))
-		F_SET(S2C(session)->cache, WT_CACHE_CLEAR_WALKS);
+	set_pass_intr = false;
+	if (!F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST)) {
+		set_pass_intr = true;
+		(void)__wt_atomic_addv32(&S2C(session)->cache->pass_intr, 1);
+	}
 
 	/* Try to remove the handle, protected by the data handle lock. */
 	WT_WITH_HANDLE_LIST_LOCK(session,
 	    tret = __conn_dhandle_remove(session, final));
+	if (set_pass_intr)
+		(void)__wt_atomic_subv32(&S2C(session)->cache->pass_intr, 1);
 	WT_TRET(tret);
 
 	/*
@@ -569,7 +587,7 @@ __wt_conn_dhandle_discard_single(
 	 */
 	if (ret == 0 || final) {
 		__conn_btree_config_clear(session);
-		WT_TRET(__conn_dhandle_destroy(session, dhandle));
+		__conn_dhandle_destroy(session, dhandle);
 		session->dhandle = NULL;
 	}
 

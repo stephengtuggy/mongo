@@ -35,6 +35,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbhelpers.h"
@@ -60,6 +61,7 @@ namespace mongo {
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace {
@@ -177,17 +179,24 @@ void ShardingState::shutDown(OperationContext* txn) {
     }
 }
 
-void ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* txn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+Status ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* txn) {
     if (serverGlobalParams.configsvrMode != CatalogManager::ConfigServerMode::NONE) {
         // Nothing to do if we're a config server ourselves.
-        return;
+        return Status::OK();
     }
 
     boost::optional<repl::OpTime> opTime = rpc::ConfigServerMetadata::get(txn).getOpTime();
     if (opTime) {
+        if (!AuthorizationSession::get(txn->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized to update config opTime");
+        }
+
         grid.shardRegistry()->advanceConfigOpTime(*opTime);
     }
+
+    return Status::OK();
 }
 
 void ShardingState::setShardName(const string& name) {
@@ -368,52 +377,6 @@ bool ShardingState::forgetPending(OperationContext* txn,
     return true;
 }
 
-void ShardingState::splitChunk(OperationContext* txn,
-                               const string& ns,
-                               const BSONObj& min,
-                               const BSONObj& max,
-                               const vector<BSONObj>& splitKeys,
-                               ChunkVersion version) {
-    invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
-    verify(it != _collMetadata.end());
-
-    ChunkType chunk;
-    chunk.setMin(min);
-    chunk.setMax(max);
-    string errMsg;
-
-    shared_ptr<CollectionMetadata> cloned(
-        it->second->cloneSplit(chunk, splitKeys, version, &errMsg));
-    // uassert to match old behavior, TODO: report errors w/o throwing
-    uassert(16857, errMsg, NULL != cloned.get());
-
-    _collMetadata[ns] = cloned;
-}
-
-void ShardingState::mergeChunks(OperationContext* txn,
-                                const string& ns,
-                                const BSONObj& minKey,
-                                const BSONObj& maxKey,
-                                ChunkVersion mergedVersion) {
-    invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
-    verify(it != _collMetadata.end());
-
-    string errMsg;
-
-    shared_ptr<CollectionMetadata> cloned(
-        it->second->cloneMerge(minKey, maxKey, mergedVersion, &errMsg));
-    // uassert to match old behavior, TODO: report errors w/o throwing
-    uassert(17004, errMsg, NULL != cloned.get());
-
-    _collMetadata[ns] = cloned;
-}
-
 bool ShardingState::inCriticalMigrateSection() {
     return _migrationSourceManager.getInCriticalSection();
 }
@@ -520,8 +483,7 @@ void ShardingState::initialize(OperationContext* txn, const string& configSvr) {
     }
 
     uassertStatusOK(_waitForInitialization(txn));
-
-    updateConfigServerOpTimeFromMetadata(txn);
+    uassertStatusOK(updateConfigServerOpTimeFromMetadata(txn));
 }
 
 void ShardingState::_initializeImpl(ConnectionString configSvr) {
@@ -925,6 +887,19 @@ shared_ptr<CollectionMetadata> ShardingState::getCollectionMetadata(const string
     } else {
         return it->second;
     }
+}
+
+void ShardingState::exchangeCollectionMetadata(OperationContext* txn,
+                                               const NamespaceString& nss,
+                                               unique_ptr<CollectionMetadata> newMetadata) {
+    invariant(txn->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    CollectionMetadataMap::iterator it = _collMetadata.find(nss.ns());
+    invariant(it != _collMetadata.end());
+
+    it->second = std::move(newMetadata);
 }
 
 /**

@@ -1942,7 +1942,7 @@ err:		if (ws != NULL)
 			ESET(ws_source_close(wtext, session, ws));
 	}
 
-	/*      
+	/*
 	 * If there was an error or our caller doesn't need the global lock,
 	 * release the global lock.
 	 */
@@ -2196,8 +2196,8 @@ helium_session_open_cursor(WT_DATA_SOURCE *wtds, WT_SESSION *session,
 			EMSG_ERR(wtext, session, ret,
 			    "value_format configuration: %s",
 			    wtext->strerror(wtext, session, ret));
-		ws->config_bitfield =
-		    v.len == 2 && isdigit(v.str[0]) && v.str[1] == 't';
+		ws->config_bitfield = v.len == 2 &&
+		    isdigit((u_char)v.str[0]) && v.str[1] == 't';
 
 		if ((ret = config_parser->get(
 		    config_parser, "helium_o_compress", &v)) != 0)
